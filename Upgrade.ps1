@@ -40,12 +40,8 @@ function Ensure-Folder {
 }
 
 function Download-File {
-    param(
-        [string]$Uri,
-        [string]$OutFile
-    )
+    param([string]$Uri, [string]$OutFile)
     try {
-        # More compatible than Invoke-WebRequest in restricted envs; no TimeoutSec misuse.
         $wc = New-Object System.Net.WebClient
         $wc.DownloadFile($Uri, $OutFile)
         return $true
@@ -62,7 +58,6 @@ function Download-File {
 }
 
 function Get-ActiveUserNames {
-    # Prefer explorer.exe ownership (works when quser is unavailable under SYSTEM)
     try {
         $procs = Get-WmiObject Win32_Process -Filter "Name='explorer.exe'" -ErrorAction SilentlyContinue
         if ($procs) {
@@ -71,7 +66,6 @@ function Get-ActiveUserNames {
     } catch {
         Log "Active user detection via WMI failed: $($_.Exception.Message)"
     }
-    # Fallback to 'quser'
     try {
         $lines = & quser 2>$null
         if ($lines) {
@@ -105,7 +99,6 @@ function Wait-For-Condition {
 Ensure-Folder $Root
 Log "Upgrade.ps1 started."
 
-# Single-instance guard (best effort)
 $LockFile = Join-Path $Root "upgrade.lock"
 try {
     if (Test-Path $LockFile) {
@@ -115,7 +108,7 @@ try {
     }
 } catch { Log "Lockfile warning: $($_.Exception.Message)" }
 
-# Locate extracted repo (project-711-d*)
+# Locate repo
 try {
     $RepoDir = (Get-ChildItem -Path $Root -Directory -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -match '^project-711-d' } | Select-Object -First 1).FullName
@@ -123,7 +116,6 @@ try {
 if (-not $RepoDir) { Fail "Repo folder not found under $Root" }
 Log "Repo detected: $RepoDir"
 
-# Basic OS sanity: if already Win11, continue (in-place is still allowed) but log
 try {
     $osV = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').DisplayVersion
     Log "Current OS DisplayVersion: $osV"
@@ -140,46 +132,36 @@ if (-not (Test-Path -LiteralPath $IsoFile)) {
     Log "ISO already present; skipping download."
 }
 
-# Prepare Setup files dir
 Ensure-Folder $SetupDir
-
-# Extract setup files from ISO if needed
 $SetupExe = Join-Path $SetupDir "setup.exe"
+
+# Extract setup files
 if (-not (Test-Path -LiteralPath $SetupExe)) {
     Log "Mounting ISO to extract setup files..."
     try {
         $disk = Mount-DiskImage -ImagePath $IsoFile -PassThru -ErrorAction Stop
-        # The volume can be slow to show up—retry until it does
         $driveLetter = $null
         $ok = Wait-For-Condition -TimeoutSec 30 -IntervalSec 2 -Condition {
             $vol = $disk | Get-Volume -ErrorAction SilentlyContinue
             if ($vol -and $vol.DriveLetter) { $script:driveLetter = $vol.DriveLetter; return $true }
             return $false
         }
-        if (-not $ok -or -not $driveLetter) {
-            throw "Mounted, but no volume/drive letter detected."
-        }
+        if (-not $ok -or -not $driveLetter) { throw "Mounted, but no volume/drive letter detected." }
         $src = "$driveLetter`:"
         Log "Copying setup files from $src to $SetupDir..."
-        # Ensure destination exists
         Ensure-Folder $SetupDir
-        # Mirror copy (safest to rehydrate full media tree)
         robocopy $src $SetupDir /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
         Log "Setup files copied."
     } catch {
         Fail "Mount/copy failure: $($_.Exception.Message)"
     } finally {
-        try {
-            Dismount-DiskImage -ImagePath $IsoFile -ErrorAction SilentlyContinue
-        } catch {
-            Log "Warning: Could not dismount ISO: $($_.Exception.Message)"
-        }
+        try { Dismount-DiskImage -ImagePath $IsoFile -ErrorAction SilentlyContinue } catch {}
     }
 } else {
     Log "Setup files already present."
 }
 
-# Write setupconfig.ini with bypasses
+# Write setupconfig.ini
 @"
 [SetupConfig]
 BypassTPMCheck=1
@@ -197,86 +179,48 @@ $Users = Get-ActiveUserNames
 $NoUser = ($Users.Count -eq 0)
 if ($NoUser) {
     Log "No active users detected — using auto reboot mode."
-    $Arguments = "/auto upgrade /quiet /compat IgnoreWarning /dynamicupdate disable /showoobe none /Telemetry Disable /eula Accept /unattend `"$SetupCfg`" /copylogs `"$Root\PantherLogs`""
+    $Arguments = "/auto upgrade /quiet /compat IgnoreWarning /dynamicupdate disable /showoobe none /Telemetry Disable /eula Accept /unattend `"$SetupCfg`""
 } else {
     Log "Active user(s) detected ($($Users -join ', ')) — using /noreboot interactive mode."
-    $Arguments = "/auto upgrade /quiet /compat IgnoreWarning /dynamicupdate disable /showoobe none /Telemetry Disable /eula Accept /unattend `"$SetupCfg`" /noreboot /copylogs `"$Root\PantherLogs`""
+    $Arguments = "/auto upgrade /quiet /compat IgnoreWarning /dynamicupdate disable /showoobe none /Telemetry Disable /eula Accept /unattend `"$SetupCfg`" /noreboot"
     try { & msg.exe * "A Windows 11 upgrade has been staged. Please reboot your PC to complete installation." } catch {}
 }
 
-# Verify setup.exe exists
-if (-not (Test-Path -LiteralPath $SetupExe)) {
-    Fail "setup.exe not found at $SetupExe"
-}
-
-# Launch strategy:
-# 1) If interactive user(s) + ServiceUI.exe -> try ServiceUI to avoid soft idle UX
-# 2) Verify setup actually starts (SetupHost/Setup) within a grace period
-# 3) If not, fallback to direct Start-Process of setup.exe
-# 4) In headless/no-user cases, run silent and detached
-
-$ServiceUI = Join-Path $RepoDir "ServiceUI.exe"
-$LaunchedWithServiceUI = $false
-$Started = $false
-
+# --- Launch setup.exe safely ---
 Log "Starting setup.exe..."
-Log "Arguments: $Arguments"
-
 try {
-    if ((-not $NoUser) -and (Test-Path -LiteralPath $ServiceUI)) {
-        Log "Attempting ServiceUI launch..."
-        # Build a robust argument string; use -f formatting to avoid quote hell
-        $svcArgs = ("-Process:explorer.exe `"{0}`" {1}" -f $SetupExe, $Arguments)
-        Start-Process -FilePath $ServiceUI -ArgumentList $svcArgs -WorkingDirectory $SetupDir -WindowStyle Hidden
-        $LaunchedWithServiceUI = $true
+    Log "Arguments: $Arguments"
+    $ServiceUI = Join-Path $RepoDir "ServiceUI.exe"
 
-        # Confirm setup has actually spawned (some environments 'soft idle' otherwise)
-        $Started = Wait-For-Condition -TimeoutSec 25 -IntervalSec 2 -Condition {
-            (Get-Process -Name SetupHost, Setup -ErrorAction SilentlyContinue) -ne $null
-        }
-        if ($Started) {
-            Log "setup.exe appears to be running (detected Setup/SetupHost)."
-        } else {
-            Log "ServiceUI launch did not result in a running setup process within the window; falling back to direct launch."
-            $LaunchedWithServiceUI = $false
-        }
+    $explorerProc = Get-WmiObject Win32_Process -Filter "Name='explorer.exe'" -ErrorAction SilentlyContinue
+    $ActiveUser = if ($explorerProc) { ($explorerProc.GetOwner().User) } else { $null }
+
+    if ((Test-Path $ServiceUI) -and $ActiveUser) {
+        Log "Active user '$ActiveUser' detected — launching setup.exe via ServiceUI..."
+        Start-Process -FilePath $ServiceUI -ArgumentList "-Process:explorer.exe `"$SetupExe`" $Arguments" -WorkingDirectory $SetupDir -WindowStyle Hidden
+    }
+    elseif (-not $ActiveUser) {
+        Log "No interactive user detected — running setup silently."
+        Start-Process -FilePath $SetupExe -ArgumentList $Arguments -WorkingDirectory $SetupDir
+    }
+    elseif (-not (Test-Path $ServiceUI)) {
+        Log "ServiceUI.exe not found — running setup normally."
+        Start-Process -FilePath $SetupExe -ArgumentList $Arguments -WorkingDirectory $SetupDir
     }
 
-    if (-not $Started) {
-        # Either no ServiceUI, no user, or ServiceUI failed to materialize the process.
-        if ($NoUser) {
-            Log "No interactive user detected — running setup silently (detached)."
-            Start-Process -FilePath $SetupExe -ArgumentList $Arguments -WorkingDirectory $SetupDir
-        } else {
-            Log "Running setup without ServiceUI (detached)."
-            Start-Process -FilePath $SetupExe -ArgumentList $Arguments -WorkingDirectory $SetupDir
-        }
-
-        # Optional: quick verify that something started; don't block forever
-        $Started = Wait-For-Condition -TimeoutSec 15 -IntervalSec 2 -Condition {
-            (Get-Process -Name SetupHost, Setup -ErrorAction SilentlyContinue) -ne $null
-        }
-        if ($Started) {
-            Log "setup.exe appears to be running after direct launch."
-        } else {
-            Log "WARNING: Could not detect Setup/SetupHost shortly after launch. It may still be staging in background."
-        }
-    }
-
-    Log ("setup.exe launched successfully ({0})." -f ($(if($LaunchedWithServiceUI) {'ServiceUI'} else {'direct'})))
-} catch {
-    Fail "Exception when starting setup: $($_.Exception.Message)"
+    Log "setup.exe launched successfully (detached)."
+}
+catch {
+    Log "ERROR running setup.exe: $($_.Exception.Message)"
+    exit 1
 }
 
-# ------------------------
-# Schedule cleanup (optional)
-# ------------------------
+# --- Register cleanup for next boot ---
 $CleanupBat = Join-Path $RepoDir "Cleanup.bat"
-if (Test-Path -LiteralPath $CleanupBat) {
+if (Test-Path $CleanupBat) {
     try {
         if (-not (Get-ScheduledTask -TaskName "Win11_Cleanup" -ErrorAction SilentlyContinue)) {
             Log "Scheduling cleanup on startup..."
-            # Robust quoting for paths with spaces
             $arg = '/c start /min ' + ('"'{0}'"' -f $CleanupBat)
             $act = New-ScheduledTaskAction -Execute "cmd.exe" -Argument $arg
             $trg = New-ScheduledTaskTrigger -AtStartup
@@ -292,8 +236,6 @@ if (Test-Path -LiteralPath $CleanupBat) {
     Log "WARNING: Cleanup.bat not found; skipping cleanup task."
 }
 
-# Done
 Log "Upgrade.ps1 completed."
-# Remove lockfile (best effort)
 try { Remove-Item -Path $LockFile -Force -ErrorAction SilentlyContinue } catch {}
 exit 0
