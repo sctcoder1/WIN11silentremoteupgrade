@@ -22,7 +22,6 @@ function Log {
 
 Log "RepoHandler started under user: $env:USERNAME"
 
-
 # --- Ensure working directory exists ---
 if (-not (Test-Path $Root)) {
     New-Item -ItemType Directory -Force -Path $Root | Out-Null
@@ -39,12 +38,20 @@ if ($Existing) {
 }
 else {
     if (Test-Path $Zip) { Remove-Item $Zip -Force -ErrorAction SilentlyContinue; Log "Removed stale zip." }
-    Log "Downloading repo zip..."
+
+    Log "Downloading repo zip from $RepoZipUrl..."
     try {
-        Invoke-WebRequest -Uri $RepoZipUrl -OutFile $Zip -UseBasicParsing
+        Invoke-WebRequest -Uri $RepoZipUrl -OutFile $Zip -UseBasicParsing -TimeoutSec 0
         Log "Download complete."
     } catch {
         Log "ERROR downloading repo: $($_.Exception.Message)"
+        exit 1
+    }
+
+    # --- Verify file size to avoid GitHub HTML error ---
+    $zipSize = (Get-Item $Zip).Length
+    if ($zipSize -lt 200000) {
+        Log "ERROR: Downloaded file too small ($zipSize bytes) — possible HTML error."
         exit 1
     }
 
@@ -52,10 +59,24 @@ else {
     try {
         Expand-Archive -Path $Zip -DestinationPath $Root -Force
         Remove-Item $Zip -Force -ErrorAction SilentlyContinue
-        $WorkDir = (Get-ChildItem -Path $Root -Directory | Where-Object { $_.Name -match 'project-711-d' } | Select-Object -First 1).FullName
-        if (-not $WorkDir) { Log "ERROR: Extracted folder not found."; exit 1 }
-        Log "Repo extracted to $WorkDir"
-    } catch {
+
+        # Normalize extracted folder name (GitHub adds -main)
+        $Extracted = Get-ChildItem -Path $Root -Directory | Where-Object { $_.Name -match 'project-711-d' } | Select-Object -First 1
+        if ($Extracted) {
+            $Normalized = Join-Path $Root "project-711-d"
+            if (Test-Path $Normalized) { Remove-Item $Normalized -Recurse -Force -ErrorAction SilentlyContinue }
+            Rename-Item -Path $Extracted.FullName -NewName "project-711-d" -ErrorAction SilentlyContinue
+            $WorkDir = $Normalized
+            Log "Repo folder renamed to consistent path: $WorkDir"
+        } else {
+            Log "ERROR: Could not locate extracted folder after Expand-Archive."
+            exit 1
+        }
+
+        Start-Sleep -Seconds 20
+        Log "Waiting 20s to ensure repo files are ready before scheduling."
+    }
+    catch {
         Log "ERROR extracting repo: $($_.Exception.Message)"
         exit 1
     }
