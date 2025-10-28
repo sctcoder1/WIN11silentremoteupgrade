@@ -1,6 +1,6 @@
 # ==============================================================
 # Upgrade.ps1 – Windows 10 → 11 Fully Silent In-Place Upgrade
-# Compatible with SYSTEM / Sophos Live Response / PDQ
+# Safe extraction (no Mount-DiskImage required)
 # ==============================================================
 
 [CmdletBinding()]
@@ -15,7 +15,7 @@ $SetupDir  = Join-Path $Root "SetupFiles"
 $SetupCfg  = Join-Path $Root "setupconfig.ini"
 
 # ------------------------
-# Logging helper
+# Logging + helpers
 # ------------------------
 function Log {
     param([string]$Message)
@@ -34,7 +34,7 @@ function Ensure-Folder { param($Path) if (-not (Test-Path $Path)) { New-Item -It
 Ensure-Folder $Root
 Log "Upgrade.ps1 started."
 
-# --- Locate repo directory (optional for cleanup) ---
+# --- Locate repo (for optional cleanup later) ---
 try {
     $RepoDir = (Get-ChildItem -Path $Root -Directory -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -match '^project-711-d' } | Select-Object -First 1).FullName
@@ -55,29 +55,49 @@ if (-not (Test-Path $IsoFile)) {
     Log "ISO already present; skipping download."
 }
 
-# --- Extract setup files ---
+# --- Extract setup files safely ---
 Ensure-Folder $SetupDir
 $SetupExe = Join-Path $SetupDir "setup.exe"
+
 if (-not (Test-Path $SetupExe)) {
-    Log "Mounting ISO..."
+    Log "Extracting ISO contents without mounting..."
     try {
-        $disk = Mount-DiskImage -ImagePath $IsoFile -PassThru -ErrorAction Stop
-        Start-Sleep -Seconds 3
-        $driveLetter = ($disk | Get-Volume -ErrorAction SilentlyContinue).DriveLetter
-        if (-not $driveLetter) { Fail "Failed to detect mounted ISO drive letter." }
-        $src = "$driveLetter`:"
-        Log "Copying setup files from $src to $SetupDir..."
-        robocopy $src $SetupDir /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
-        Dismount-DiskImage -ImagePath $IsoFile
-        Log "Setup files copied."
+        Expand-Archive -Path $IsoFile -DestinationPath $SetupDir -Force -ErrorAction Stop
+        Log "ISO extracted successfully using Expand-Archive."
     } catch {
-        Fail "ISO mount or copy failed: $($_.Exception.Message)"
+        Log "Expand-Archive failed: $($_.Exception.Message)"
+        Log "Attempting DISM or 7-Zip fallback..."
+
+        # DISM fallback (if ISO is a real WIM image)
+        try {
+            dism /Mount-Image /ImageFile:$IsoFile /MountDir:$SetupDir /ReadOnly | Out-Null
+            Log "DISM mount successful (read-only)."
+        } catch {
+            # Optional 7-Zip fallback if installed
+            $SevenZip = "C:\Program Files\7-Zip\7z.exe"
+            if (Test-Path $SevenZip) {
+                try {
+                    & $SevenZip x $IsoFile "-o$SetupDir" -y | Out-Null
+                    Log "ISO extracted successfully using 7-Zip fallback."
+                } catch {
+                    Fail "7-Zip extraction failed: $($_.Exception.Message)"
+                }
+            } else {
+                Fail "No valid extraction method available (Expand-Archive, DISM, 7-Zip all failed)."
+            }
+        }
     }
 } else {
     Log "Setup files already available at $SetupDir."
 }
 
-# --- Create setupconfig.ini for bypass checks ---
+# --- Validate setup.exe ---
+if (-not (Test-Path $SetupExe)) {
+    Fail "setup.exe still not found after extraction. Verify ISO integrity."
+}
+Log "setup.exe located at $SetupExe."
+
+# --- Create setupconfig.ini (bypass checks) ---
 @"
 [SetupConfig]
 BypassTPMCheck=1
@@ -109,7 +129,7 @@ if ($RepoDir) {
     if (Test-Path $CleanupBat) {
         try {
             if (-not (Get-ScheduledTask -TaskName "Win11_Cleanup" -ErrorAction SilentlyContinue)) {
-                Log "Scheduling cleanup task..."
+                Log "Scheduling cleanup on startup..."
                 $act = New-ScheduledTaskAction -Execute "cmd.exe" -Argument ("/c start /min `"" + $CleanupBat + "`"")
                 $trg = New-ScheduledTaskTrigger -AtStartup
                 Register-ScheduledTask -TaskName "Win11_Cleanup" -Action $act -Trigger $trg -RunLevel Highest -Force | Out-Null
