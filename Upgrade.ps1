@@ -1,35 +1,47 @@
-# --- Config ---
-$UpgradeDir = "C:\Win11Upgrade"
-$IsoUrl = "https://dooleydigital.dev/files/Win11_24H2_English_x64.iso"
-$IsoFile = Join-Path $UpgradeDir "Win11_24H2_English_x64.iso"
-$SetupCfg = Join-Path $UpgradeDir "setupconfig.ini"
-$LogFile = Join-Path $UpgradeDir "upgrade.log"
+# Upgrade.ps1
+# Performs Windows 11 in-place upgrade silently with requirement bypass
 
-# --- Logging helper ---
-function Log($m){ "$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss')) `t $m" | Out-File $LogFile -Append }
+$Root      = "C:\Win11Upgrade"
+$IsoUrl    = "https://dooleydigital.dev/files/Win11_24H2_English_x64.iso"   # your ISO URL
+$IsoFile   = Join-Path $Root "Win11_24H2_English_x64.iso"
+$SetupCfg  = Join-Path $Root "setupconfig.ini"
+$LogFile   = Join-Path $Root "Upgrade.log"
 
-Log "Starting upgrade script."
+function Log($m){ ("[$(Get-Date)] $m") | Out-File $LogFile -Append }
 
-# --- Download ISO if needed ---
+Log "=== Starting Windows 11 In-Place Upgrade ==="
+
+# --- Download ISO only if missing ---
 if (-not (Test-Path $IsoFile)) {
     Log "Downloading ISO..."
-    Invoke-WebRequest -Uri $IsoUrl -OutFile $IsoFile -UseBasicParsing
+    try {
+        Invoke-WebRequest -Uri $IsoUrl -OutFile $IsoFile -UseBasicParsing -TimeoutSec 0
+        Log "ISO downloaded successfully."
+    } catch {
+        Log "ERROR: Failed to download ISO. $_"
+        exit 1
+    }
 } else {
-    Log "ISO already exists."
+    Log "ISO already present. Skipping download."
 }
 
-# --- Mount ISO and copy contents ---
-$disk = Mount-DiskImage -ImagePath $IsoFile -PassThru
-Start-Sleep 3
-$drive = ($disk | Get-Volume).DriveLetter
-$src = "$drive`:"
+# --- Mount ISO and copy setup files if not already extracted ---
+$SetupDir = Join-Path $Root "SetupFiles"
+if (-not (Test-Path (Join-Path $SetupDir "setup.exe"))) {
+    Log "Mounting ISO..."
+    $disk = Mount-DiskImage -ImagePath $IsoFile -PassThru
+    Start-Sleep 3
+    $drive = ($disk | Get-Volume).DriveLetter
+    $src = "$drive`:"
+    Log "Copying setup files..."
+    robocopy $src $SetupDir /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
+    Dismount-DiskImage -ImagePath $IsoFile
+    Log "Extraction complete."
+} else {
+    Log "Setup files already exist at $SetupDir."
+}
 
-Log "Copying setup files..."
-robocopy $src $UpgradeDir /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
-Dismount-DiskImage -ImagePath $IsoFile
-Remove-Item $IsoFile -Force -ErrorAction SilentlyContinue
-
-# --- Bypass setup checks ---
+# --- Create SetupConfig.ini (bypass checks) ---
 @"
 [SetupConfig]
 BypassTPMCheck=1
@@ -40,40 +52,47 @@ BypassCPUCheck=1
 DynamicUpdate=Disable
 Telemetry=Disable
 "@ | Out-File $SetupCfg -Encoding ascii -Force
+Log "SetupConfig.ini created."
 
-# --- Detect users ---
-$active = (& quser 2>$null) -match "Active"
-$NoUser = [string]::IsNullOrWhiteSpace(($active -join ''))
+# --- Determine user login state ---
+$activeUsers = (& quser 2>$null) -match "Active"
+$NoUser = [string]::IsNullOrWhiteSpace(($activeUsers -join ''))
+
 if ($NoUser) {
-    Log "No active user detected. Will reboot automatically."
+    Log "No active user detected. Reboot will occur automatically."
     $Args = "/auto upgrade /quiet /compat IgnoreWarning /dynamicupdate Disable /showoobe none /Telemetry Disable /eula Accept /unattend `"$SetupCfg`""
 } else {
-    Log "Active user logged in. No automatic reboot."
+    Log "Active user(s) detected. Suppressing reboot."
     $Args = "/auto upgrade /quiet /compat IgnoreWarning /dynamicupdate Disable /showoobe none /Telemetry Disable /eula Accept /unattend `"$SetupCfg`" /noreboot"
-    try { & msg.exe * "Windows 11 upgrade staged. Please reboot to finish installation." } catch {}
+    try { & msg.exe * "A Windows 11 upgrade has been prepared. Please reboot when convenient to complete installation." } catch {}
 }
 
-# --- Start setup ---
+# --- Launch setup.exe ---
+$SetupExe = Join-Path $SetupDir "setup.exe"
+if (-not (Test-Path $SetupExe)) {
+    Log "ERROR: setup.exe not found in $SetupDir"
+    exit 1
+}
+
 Log "Starting setup.exe..."
-Start-Process -FilePath (Join-Path $UpgradeDir "setup.exe") -ArgumentList $Args -Wait
-Log "Setup.exe completed."
-
-# --- Schedule cleanup ---
-$CleanupScript = @"
-Start-Sleep -Seconds 20
 try {
-    if ((Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').ProductName -match 'Windows 11') {
-        Remove-Item -Recurse -Force 'C:\Win11Upgrade' -ErrorAction SilentlyContinue
-        Remove-LocalUser -Name 'WinUpgTemp' -ErrorAction SilentlyContinue
-        schtasks /Delete /TN 'Win11_Upgrade_Start' /F
-        schtasks /Delete /TN 'Win11_Cleanup' /F
-    }
-} catch {}
-"@
-$CleanupPath = Join-Path $UpgradeDir "cleanup.ps1"
-$CleanupScript | Out-File $CleanupPath -Encoding ascii
-$act = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$CleanupPath`""
-$trg = New-ScheduledTaskTrigger -AtStartup
-Register-ScheduledTask -TaskName "Win11_Cleanup" -Action $act -Trigger $trg -RunLevel Highest -Force | Out-Null
+    Start-Process -FilePath $SetupExe -ArgumentList $Args -Wait
+    Log "setup.exe completed successfully."
+} catch {
+    Log "ERROR running setup.exe: $_"
+    exit 1
+}
 
-Log "Upgrade launched successfully."
+# --- Schedule cleanup for next boot ---
+$CleanupBat = Join-Path $Root "Cleanup.bat"
+if (Test-Path $CleanupBat) {
+    Log "Scheduling cleanup task..."
+    $act = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c start /min `"$CleanupBat`""
+    $trg = New-ScheduledTaskTrigger -AtStartup
+    Register-ScheduledTask -TaskName "Win11_Cleanup" -Action $act -Trigger $trg -RunLevel Highest -Force | Out-Null
+} else {
+    Log "WARNING: Cleanup.bat not found; skipping task registration."
+}
+
+Log "=== Upgrade process completed ==="
+exit 0
