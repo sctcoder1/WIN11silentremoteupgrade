@@ -83,22 +83,28 @@ if (-not (Test-Path $SetupExe)) {
 Log "Starting setup.exe..."
 try {
     $SetupExe = Join-Path $SetupDir "setup.exe"
-    $Arguments = if ($NoUser) {
-        "/auto upgrade /quiet /compat IgnoreWarning /dynamicupdate Disable /showoobe none /Telemetry Disable /eula Accept /unattend `"$SetupCfg`""
-    } else {
-        "/auto upgrade /quiet /compat IgnoreWarning /dynamicupdate Disable /showoobe none /Telemetry Disable /eula Accept /unattend `"$SetupCfg`" /noreboot"
+
+    if ($NoUser) {
+        $Arguments = "/auto upgrade /quiet /compat IgnoreWarning /dynamicupdate Disable /showoobe none /Telemetry Disable /eula Accept /unattend `"$SetupCfg`""
+    }
+    else {
+        $Arguments = "/auto upgrade /quiet /compat IgnoreWarning /dynamicupdate Disable /showoobe none /Telemetry Disable /eula Accept /unattend `"$SetupCfg`" /noreboot"
     }
 
     if (-not [string]::IsNullOrWhiteSpace($Arguments)) {
+        Log "Running setup.exe with arguments: $Arguments"
         Start-Process -FilePath $SetupExe -ArgumentList $Arguments -Wait
         Log "Setup.exe executed successfully."
-    } else {
+    }
+    else {
         Log "ERROR: Argument list is empty — skipping setup."
     }
-} catch {
+}
+catch {
     Log "ERROR running setup.exe: $($_.Exception.Message)"
     exit 1
 }
+
 
 # --- Register cleanup to run at next boot ---
 $CleanupBat = Join-Path $RepoDir "Cleanup.bat"
