@@ -1,5 +1,5 @@
 # ==============================================================
-# Upgrade.ps1 - Windows 10 → Windows 11 automated upgrade
+# Upgrade.ps1 - Windows 10 → Windows 11 Automated Upgrade (VISIBLE TEST MODE)
 # ==============================================================
 
 $ErrorActionPreference = 'Stop'
@@ -64,13 +64,13 @@ Log "setupconfig.ini written."
 $active = (& quser 2>$null) -match "Active"
 $NoUser = [string]::IsNullOrWhiteSpace(($active -join ''))
 if ($NoUser) {
-    Log "No active users detected — will allow automatic reboot."
+    Log "No active users detected — automatic reboot will be allowed."
 } else {
-    Log "Active user(s) detected — will suppress reboot."
-    try { & msg.exe * "A Windows 11 upgrade has been staged. Please reboot to complete installation." } catch {}
+    Log "Active user(s) detected — suppressing reboot."
+    try { & msg.exe * "A Windows 11 upgrade has been staged. You’ll now see the installer window." } catch {}
 }
 
-# --- Build setup command ---
+# --- Build setup command (NO /quiet so the UI shows) ---
 $SetupExe = Join-Path $SetupDir "setup.exe"
 if (-not (Test-Path $SetupExe)) {
     Log "ERROR: setup.exe not found at $SetupExe"
@@ -78,17 +78,17 @@ if (-not (Test-Path $SetupExe)) {
 }
 
 if ($NoUser) {
-    $Arguments = "/auto upgrade /quiet /compat IgnoreWarning /dynamicupdate disable /showoobe none /Telemetry Disable /eula Accept /unattend `"$SetupCfg`""
+    $Arguments = "/auto upgrade /compat IgnoreWarning /dynamicupdate disable /showoobe none /Telemetry Disable /eula Accept /unattend `"$SetupCfg`""
 } else {
-    $Arguments = "/auto upgrade /quiet /compat IgnoreWarning /dynamicupdate disable /showoobe none /Telemetry Disable /eula Accept /unattend `"$SetupCfg`" /noreboot"
+    $Arguments = "/auto upgrade /compat IgnoreWarning /dynamicupdate disable /showoobe none /Telemetry Disable /eula Accept /unattend `"$SetupCfg`" /noreboot"
 }
 
-# --- Run setup.exe ---
+# --- Run setup.exe (interactive) ---
 Log "Starting setup.exe..."
 try {
     Log "Arguments: $Arguments"
-    Start-Process -FilePath $SetupExe -ArgumentList $Arguments -Wait
-    Log "setup.exe executed successfully."
+    Start-Process -FilePath $SetupExe -ArgumentList $Arguments -WorkingDirectory $SetupDir
+    Log "setup.exe launched visibly (no /quiet)."
 } catch {
     Log "ERROR running setup.exe: $($_.Exception.Message)"
     exit 1
@@ -110,5 +110,5 @@ if (Test-Path $CleanupBat) {
     Log "WARNING: Cleanup.bat not found; manual cleanup required."
 }
 
-Log "Upgrade.ps1 completed."
+Log "Upgrade.ps1 completed (visible test mode)."
 exit 0
