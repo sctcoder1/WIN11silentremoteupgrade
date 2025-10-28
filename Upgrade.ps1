@@ -1,309 +1,341 @@
 <#
 Upgrade.ps1
-Fully automated Windows 11 in-place upgrade orchestrator.
+Fully contained Win11 silent remote upgrade orchestration.
+Everything lives under C:\Win11Upgrade
 
-Edit at top:
-- $SourceUri : URL to a .zip containing the extracted Windows 11 install folder (setup.exe at root of extracted), OR a direct ISO (will mount and copy).
-- $CreateTempAdmin : $true to create a temporary admin account (name: UpgradeMonitor) for visibility/testing.
-- $TempAdminName : username for temporary admin.
-- $CleanupAfterSuccess : $true to remove folder, temp user, tasks after successful upgrade.
+Default SourceUri: Github main.zip of sctcoder1/WIN11silentremoteupgrade (replace if you want a different source)
+Recommended: host a ZIP containing the *extracted* Windows installer layout (setup.exe at the ZIP root).
+
+Usage:
+  - Run elevated (script will relaunch itself elevated if needed).
+  - Example via Sophos Live Response (SYSTEM): powershell -ExecutionPolicy Bypass -NoProfile -File "C:\Win11Upgrade\Upgrade.ps1"
 
 Test in a VM first.
 #>
 
-# --- CONFIG --- modify if you want
-$SourceUri = "https://raw.githubusercontent.com/your/repo/main/win11-extracted.zip"
-$CreateTempAdmin = $true
-$TempAdminName = "UpgradeMonitor"
-$TempAdminPasswordPlain = [System.Web.Security.Membership]::GeneratePassword(14,2) # random-ish
-$UpgradeFolder = "C:\Win11Upgrade"
-$LogFile = Join-Path $UpgradeFolder "upgrade-orch.log"
-$CleanupAfterSuccess = $true
-$ScheduledRebootCheckName = "Win11Upgrade_RebootCheck"
-$ScheduledRunNowName = "Win11Upgrade_RunNow"
-$ScheduledCleanupName = "Win11Upgrade_Cleanup"
+param(
+    [string]$SourceUri = "https://github.com/sctcoder1/WIN11silentremoteupgrade/archive/refs/heads/main.zip",
+    [switch]$UseTempAdmin = $true,                # Set to $false to skip creating the temporary admin
+    [string]$TempAdminName = "UpgradeMonitor",
+    [int]$RebootCheckMinutes = 30                 # how often the reboot checker runs (minutes)
+)
 
-# --- helper logging ---
+# --- Configuration (internal) ---
+$UpgradeFolder      = "C:\Win11Upgrade"
+$LogFile            = Join-Path $UpgradeFolder "upgrade-orch.log"
+$SetupConfigPath    = Join-Path $UpgradeFolder "setupconfig.ini"
+$SetupExePath       = Join-Path $UpgradeFolder "setup.exe"
+$TempAdminPasswordPlain = [System.Web.Security.Membership]::GeneratePassword(14,2)
+$ScheduledRunNowName = "Win11Upgrade_RunNow"
+$ScheduledRebootCheckName = "Win11Upgrade_RebootCheck"
+$ScheduledCleanupName = "Win11Upgrade_Cleanup"
+$PostCleanupScript   = Join-Path $UpgradeFolder "post-upgrade-cleanup.ps1"
+$RebootCheckScript   = Join-Path $UpgradeFolder "reboot-check.ps1"
+
+# --- Helpers ---
 Function Log {
-    param($s)
+    param([string]$s)
     $t = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-    "$t`t$s" | Out-File -FilePath $LogFile -Append -Encoding utf8
+    $line = "$t`t$s"
+    Try { $line | Out-File -FilePath $LogFile -Append -Encoding utf8 -ErrorAction SilentlyContinue } Catch {}
     Write-Output $s
 }
 
-# --- ensure elevated ---
-If (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
-    Log "Not running elevated. Re-launching as admin..."
-    Start-Process -FilePath "powershell" -ArgumentList "-ExecutionPolicy Bypass -NoProfile -File `"$PSCommandPath`"" -Verb RunAs
-    Exit 0
-}
-Log "Running as Administrator."
-
-# --- prepare folder ---
-New-Item -Path $UpgradeFolder -ItemType Directory -Force | Out-Null
-Log "Upgrade folder: $UpgradeFolder"
-
-# --- download & stage install files ---
-Function Stage-InstallFiles {
-    param($uri, $dest)
-    Try {
-        Log "Beginning stage from $uri"
-        $lower = $uri.ToLower()
-        if ($lower -like "*.iso" -or $lower -like "*.iso*") {
-            # Download ISO then mount & copy
-            $iso = Join-Path $dest "win11.iso"
-            Log "Downloading ISO to $iso"
-            Invoke-WebRequest -Uri $uri -OutFile $iso -UseBasicParsing -ErrorAction Stop
-            Log "Mounting ISO"
-            $mount = Mount-DiskImage -ImagePath $iso -PassThru
-            Start-Sleep -Seconds 2
-            $vol = (Get-Volume | Where-Object {$_.DriveType -eq 'CD-ROM'} | Select-Object -First 1).DriveLetter + ":\"
-            Log "Copying contents from $vol to $dest"
-            robocopy $vol $dest /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
-            Dismount-DiskImage -ImagePath $iso
-            Remove-Item $iso -Force -ErrorAction SilentlyContinue
-            Log "ISO staged"
-        } else {
-            # assume zip or extracted folder. If zip: expand
-            $lowerUri = $uri.ToLower()
-            if ($lowerUri -like "*.zip" -or $lowerUri -like "*.zip*") {
-                $zipfile = Join-Path $dest "stage.zip"
-                Log "Downloading zip to $zipfile"
-                Invoke-WebRequest -Uri $uri -OutFile $zipfile -UseBasicParsing -ErrorAction Stop
-                Log "Expanding zip"
-                Expand-Archive -Path $zipfile -DestinationPath $dest -Force
-                Remove-Item $zipfile -Force
-                Log "Zip expanded"
+# Relaunch elevated if not admin
+If (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Log "Not elevated. Relaunching elevated..."
+    $arg = "-ExecutionPolicy Bypass -NoProfile -File `"$PSCommandPath`""
+    if ($PSBoundParameters.Count -gt 0) {
+        # recompose param string
+        $paramPairs = @()
+        foreach ($k in $PSBoundParameters.Keys) {
+            $v = $PSBoundParameters[$k]
+            if ($v -is [switch]) {
+                if ($v.IsPresent) { $paramPairs += "-$k" }
             } else {
-                # attempt to download a single file or directory listing - try raw download to a temporary path
-                Log "Unknown extension - attempting to Invoke-WebRequest directly into folder (may fail)"
-                $fileDest = Join-Path $dest (Split-Path $uri -Leaf)
-                Invoke-WebRequest -Uri $uri -OutFile $fileDest -UseBasicParsing -ErrorAction Stop
+                $escaped = $v.Replace("`"","`"`"")
+                $paramPairs += "-$k `"$escaped`""
             }
         }
+        $arg = $arg + " " + ($paramPairs -join ' ')
+    }
+    Start-Process -FilePath "powershell.exe" -ArgumentList $arg -Verb RunAs -WindowStyle Hidden
+    Exit 0
+}
+
+# --- Ensure staging folder exists ---
+Try { New-Item -ItemType Directory -Path $UpgradeFolder -Force | Out-Null } Catch { Log "Failed creating $UpgradeFolder: $_"; Exit 10 }
+Log "Working folder: $UpgradeFolder"
+
+# --- Logging startup info ---
+Log "Upgrade orchestration started."
+Log "SourceUri: $SourceUri"
+Log "UseTempAdmin: $UseTempAdmin"
+Log "TempAdminName: $TempAdminName"
+
+# --- Stage install files: supports .zip (recommended) or .iso ---
+Function Stage-InstallFiles {
+    param([string]$uri, [string]$dest)
+    if ([string]::IsNullOrWhiteSpace($uri)) {
+        Log "No SourceUri provided - assuming setup.exe already present in $dest."
         return $true
-    } catch {
-        Log "Error staging install files: $($_.Exception.Message)"
+    }
+
+    $lower = $uri.ToLower()
+    Try {
+        If ($lower.EndsWith(".iso")) {
+            $iso = Join-Path $dest "win11.iso"
+            Log "Downloading ISO to $iso ..."
+            Invoke-WebRequest -Uri $uri -OutFile $iso -UseBasicParsing -ErrorAction Stop
+            Log "Mounting ISO..."
+            Mount-DiskImage -ImagePath $iso -PassThru | Out-Null
+            Start-Sleep -Seconds 3
+            $vol = (Get-Volume | Where-Object { $_.DriveType -eq 'CD-ROM' } | Select-Object -First 1).DriveLetter + ":\"
+            if (-not $vol) { Throw "Mounted ISO but volume not found." }
+            Log "Copying contents from $vol to $dest ..."
+            robocopy $vol $dest /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
+            Dismount-DiskImage -ImagePath $iso -ErrorAction SilentlyContinue
+            Remove-Item -Path $iso -Force -ErrorAction SilentlyContinue
+            Log "ISO staged."
+            return $true
+        } elseif ($lower.EndsWith(".zip")) {
+            $zipfile = Join-Path $dest "stage.zip"
+            Log "Downloading zip to $zipfile ..."
+            Invoke-WebRequest -Uri $uri -OutFile $zipfile -UseBasicParsing -ErrorAction Stop
+            Log "Expanding zip..."
+            Expand-Archive -Path $zipfile -DestinationPath $dest -Force
+            Remove-Item -Path $zipfile -Force -ErrorAction SilentlyContinue
+            Log "ZIP expanded."
+            return $true
+        } else {
+            Log "SourceUri extension unsupported (expected .iso or .zip). Attempting direct download to file though may not be correct..."
+            $out = Join-Path $dest (Split-Path $uri -Leaf)
+            Invoke-WebRequest -Uri $uri -OutFile $out -UseBasicParsing -ErrorAction Stop
+            Log "Downloaded $uri to $out"
+            return $true
+        }
+    } Catch {
+        Log "Error in Stage-InstallFiles: $($_.Exception.Message)"
         return $false
     }
 }
 
-if (-not(Test-Path (Join-Path $UpgradeFolder "setup.exe"))) {
-    $staged = Stage-InstallFiles -uri $SourceUri -dest $UpgradeFolder
-    if (-not $staged) {
-        Log "Staging failed. Aborting."
-        Exit 2
+# --- Ensure setup.exe is present; stage if missing ---
+If (-not (Test-Path -Path $SetupExePath)) {
+    Log "setup.exe not found. Attempting to stage from SourceUri..."
+    $ok = Stage-InstallFiles -uri $SourceUri -dest $UpgradeFolder
+    If (-not $ok -or -not (Test-Path -Path $SetupExePath)) {
+        Log "Failed to stage setup.exe. Aborting."
+        Exit 20
     }
 } else {
     Log "setup.exe already present; skipping staging."
 }
 
-# --- create setupconfig.ini to bypass requirements ---
-$SetupConfig = @"
+# --- Write setupconfig.ini to bypass checks ---
+$setupConfigContent = @"
 [SetupConfig]
 BypassTPMCheck=1
 BypassSecureBootCheck=1
 BypassRAMCheck=1
 BypassStorageCheck=1
 BypassCPUCheck=1
+DynamicUpdate=Disable
+Telemetry=Disable
 "@
-$SetupConfigPath = Join-Path $UpgradeFolder "setupconfig.ini"
-$SetupConfig | Out-File -FilePath $SetupConfigPath -Encoding ascii -Force
-Log "Wrote setupconfig.ini to bypass hardware checks."
+Try {
+    $setupConfigContent | Out-File -FilePath $SetupConfigPath -Encoding ascii -Force
+    Log "Wrote setupconfig.ini to $SetupConfigPath"
+} Catch { Log "Failed writing setupconfig.ini: $_"; Exit 21 }
 
-# --- find interactive sessions (Active users) ---
-Function Get-ActiveInteractiveUsers {
+# --- Detect interactive (console) users signed in ---
+Function Get-InteractiveUsers {
     $users = @()
-    try {
-        $quser = & quser 2>&1
-        if ($LASTEXITCODE -eq 0) {
+    Try {
+        $quser = & quser 2>$null
+        if ($LASTEXITCODE -eq 0 -and $quser) {
             foreach ($line in $quser) {
-                # parse "USERNAME SESSIONNAME ID STATE ..."
-                $cols = ($line -replace '\s+',' ') -split ' '
-                if ($cols.Length -ge 3) {
-                    if ($line -match 'Active') {
-                        $name = $cols[0].Trim()
-                        if ($name -and $name -ne "USERNAME") { $users += $name }
+                # remove repeated spaces, split
+                $norm = ($line -replace '\s+',' ')
+                $parts = $norm.Trim() -split ' '
+                if ($parts.Length -ge 3) {
+                    $state = $parts[2]
+                    if ($state -match 'Active|Console') {
+                        $users += $parts[0]
                     }
                 }
             }
-        } else {
-            # fallback - find owner of explorer.exe (console user)
+        }
+    } Catch { Log "quser detection failed: $_" }
+
+    # fallback: owner of explorer.exe if nothing found
+    if ($users.Count -eq 0) {
+        Try {
             $proc = Get-Process -Name explorer -ErrorAction SilentlyContinue | Select-Object -First 1
             if ($proc) {
-                $owner = (Get-CimInstance Win32_Process -Filter "ProcessId=$($proc.Id)" | ForEach-Object {
-                    $null = $_.GetOwner(); $_.GetOwner().User
-                }) -join ','
+                $owner = (Get-CimInstance Win32_Process -Filter "ProcessId=$($proc.Id)" | ForEach-Object { ($_.GetOwner()).User }) -join ','
                 if ($owner) { $users += $owner }
             }
-        }
-    } catch {
-        Log "Get-ActiveInteractiveUsers fallback error: $_"
+        } Catch {}
     }
+
     return $users | Select-Object -Unique
 }
 
-$activeUsers = Get-ActiveInteractiveUsers
-if ($activeUsers.Count -eq 0) {
-    Log "No active interactive users detected."
+$activeUsers = Get-InteractiveUsers
+If ($activeUsers.Count -eq 0) {
+    Log "No interactive users detected."
     $NoUserSignedIn = $true
 } else {
-    Log "Active interactive user(s): $($activeUsers -join ',')"
+    Log "Interactive user(s) detected: $($activeUsers -join ', ')"
     $NoUserSignedIn = $false
 }
 
-# --- optional: create temp admin user for monitoring ---
-if ($CreateTempAdmin) {
-    try {
-        if (Get-LocalUser -Name $TempAdminName -ErrorAction SilentlyContinue) {
-            Log "Temp admin $TempAdminName already exists - leaving it."
-        } else {
-            Log "Creating temp admin user $TempAdminName"
-            $securePass = ConvertTo-SecureString -String $TempAdminPasswordPlain -AsPlainText -Force
-            New-LocalUser -Name $TempAdminName -Password $securePass -FullName "Upgrade Monitor" -Description "Temporary monitoring account for Win11 upgrade" -PasswordNeverExpires
+# --- Optional: create temporary admin account so process appears under that name in Task Manager ---
+If ($UseTempAdmin) {
+    Try {
+        if (-not (Get-LocalUser -Name $TempAdminName -ErrorAction SilentlyContinue)) {
+            Log "Creating temporary admin account: $TempAdminName"
+            $secure = ConvertTo-SecureString -String $TempAdminPasswordPlain -AsPlainText -Force
+            New-LocalUser -Name $TempAdminName -Password $secure -FullName "Upgrade Monitor" -Description "Temporary account for Win11 upgrade monitoring" -PasswordNeverExpires -UserMayNotChangePassword:$false
             Add-LocalGroupMember -Group "Administrators" -Member $TempAdminName
-            Log "Created temp admin $TempAdminName (passwd in log)."
-            "Temp admin password: $TempAdminPasswordPlain" | Out-File -FilePath $LogFile -Append
+            "Temp admin password: $TempAdminPasswordPlain" | Out-File -FilePath $LogFile -Append -Encoding utf8
+            Log "Temp admin created and added to Administrators. (Password logged to logfile for testing - remove after.)"
+        } else {
+            Log "Temp admin $TempAdminName already exists; leaving it unchanged."
         }
-    } catch {
+    } Catch {
         Log "Error creating temp admin: $($_.Exception.Message)"
     }
 }
 
-# --- prepare setup.exe commandline flags ---
-$SetupExe = Join-Path $UpgradeFolder "setup.exe"
-if (-not (Test-Path $SetupExe)) {
-    Log "setup.exe not found at $SetupExe - abort."
-    Exit 3
-}
-
-# Base common args
+# --- Build setup.exe arguments; if interactive users present add /noreboot ---
 $BaseArgs = "/auto upgrade /quiet /compat IgnoreWarning /dynamicupdate Disable /showoobe none /Telemetry Disable /eula Accept /unattend `"$SetupConfigPath`" /copylogs `"$UpgradeFolder\setup-logs`""
-
-# If no users signed in -> allow reboot
-if ($NoUserSignedIn) {
-    Log "No interactive users: installer will run allowing auto-reboot when required."
-    $RunArgs = $BaseArgs  # do NOT include /noreboot so setup may reboot
+If ($NoUserSignedIn) {
+    $RunArgs = $BaseArgs   # allow reboot if installer needs
+    Log "No interactive user -> installer will be allowed to reboot."
 } else {
-    Log "Interactive users present: installer will run with /noreboot to avoid rebooting them."
     $RunArgs = $BaseArgs + " /noreboot"
+    Log "Interactive user(s) present -> /noreboot will be used to avoid disrupting them."
 }
 
-# --- Run the installer ---
+# --- Function: start installer (preferred method: register scheduled task to run under temp admin for visibility) ---
 Function Start-Installer {
-    param($exe, $args, $useScheduledTaskUser)
-    try {
-        if ($useScheduledTaskUser -and $CreateTempAdmin) {
-            # Create a scheduled task to run as the TempAdmin user (so the process shows under that user)
-            $action = New-ScheduledTaskAction -Execute $exe -Argument $args
-            $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(10)
+    param([string]$exePath, [string]$arguments)
+
+    if ($UseTempAdmin) {
+        Try {
+            Log "Creating one-time scheduled task $ScheduledRunNowName to run installer as $TempAdminName..."
+            $action = New-ScheduledTaskAction -Execute $exePath -Argument $arguments
+            $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(15)
             $principal = New-ScheduledTaskPrincipal -UserId $TempAdminName -LogonType Password -RunLevel Highest
-            $cred = New-Object System.Management.Automation.PSCredential($TempAdminName, (ConvertTo-SecureString $TempAdminPasswordPlain -AsPlainText -Force))
-            Register-ScheduledTask -TaskName $ScheduledRunNowName -Action $action -Trigger $trigger -Principal $principal -Password $TempAdminPasswordPlain -Force
+            Register-ScheduledTask -TaskName $ScheduledRunNowName -Action $action -Trigger $trigger -Principal $principal -Password $TempAdminPasswordPlain -Force | Out-Null
             Start-ScheduledTask -TaskName $ScheduledRunNowName
-            Log "Registered and started scheduled task $ScheduledRunNowName to run installer as $TempAdminName."
-        } else {
-            Log "Starting setup.exe directly under current account (SYSTEM). Command: `"$exe`" $args"
-            $psi = New-Object System.Diagnostics.ProcessStartInfo
-            $psi.FileName = $exe
-            $psi.Arguments = $args
-            $psi.RedirectStandardOutput = $false
-            $psi.UseShellExecute = $true
-            $psi.Verb = "runas"
-            [System.Diagnostics.Process]::Start($psi) | Out-Null
-            Log "Started installer process."
+            Log "Scheduled and started $ScheduledRunNowName."
+            return $true
+        } Catch {
+            Log "Failed scheduling installer under $TempAdminName: $($_.Exception.Message). Falling back to direct start."
         }
+    }
+
+    Try {
+        Log "Starting setup.exe directly (current context / SYSTEM)."
+        Start-Process -FilePath $exePath -ArgumentList $arguments -WindowStyle Hidden
         return $true
-    } catch {
-        Log "Failed to start installer: $($_.Exception.Message)"
+    } Catch {
+        Log "Direct start failed: $($_.Exception.Message)"
         return $false
     }
 }
 
-$started = Start-Installer -exe $SetupExe -args $RunArgs -useScheduledTaskUser $true
-if (-not $started) {
-    Log "Installer failed to start. Aborting."
-    Exit 4
+# --- Start the installer ---
+$started = Start-Installer -exePath $SetupExePath -arguments $RunArgs
+If (-not $started) {
+    Log "Failed to start installer. Aborting."
+    Exit 30
 }
 
-# --- if users logged in: notify them & create desktop notice & schedule reboot-check ---
-if (-not $NoUserSignedIn) {
-    Log "Notifying interactive users of pending reboot and creating Desktop notice."
-
+# --- If interactive users present: notify them and create desktop notices; register recurring reboot-check task ---
+If (-not $NoUserSignedIn) {
+    Log "Notifying interactive users and creating desktop notices..."
     foreach ($u in $activeUsers) {
-        try {
-            # Send msg to user (works on domain/Terminal Services setups). Will be skipped silently if it fails.
-            & msg.exe $u "Windows 11 upgrade has finished installing and a reboot is required to complete the update. Please save your work. The system will not reboot while someone is signed in." 2>$null
-        } catch { }
+        Try {
+            # try messaging by session name (if domain env supports it)
+            & msg.exe $u "Windows 11 upgrade was installed. A reboot is required to finish installation. The system will NOT reboot while users are signed in. Please save your work." 2>$null
+        } Catch {}
     }
 
-    # Create a desktop text notice for each profile
-    $profiles = Get-CimInstance -ClassName Win32_UserProfile | Where-Object { $_.Loaded -eq $false -or $_.LocalPath -ne $null }
-    foreach ($p in $profiles) {
-        try {
-            $desktop = Join-Path $p.LocalPath "Desktop"
-            if (Test-Path $desktop) {
+    # Create a Desktop notice for each local profile found
+    Try {
+        $profiles = Get-CimInstance -ClassName Win32_UserProfile | Where-Object { $_.LocalPath -and -not $_.Special } 
+        foreach ($p in $profiles) {
+            $desk = Join-Path $p.LocalPath "Desktop"
+            if (Test-Path $desk) {
                 $notice = @"
-Windows 11 upgrade completed.
-A reboot is required to finish the installation.
-Please save your work and reboot, or the system will reboot when no users are signed in (a checker will run every 30 minutes).
+Windows 11 upgrade completed staging.
+A reboot is required to finish installing Windows 11.
+Please save your work and reboot at your convenience.
+If you leave the system signed in, it will not reboot.
+A scheduled checker will attempt to reboot when no users are signed in.
 "@
-                $notice | Out-File -FilePath (Join-Path $desktop "WINDOWS11_REBOOT_REQUIRED.txt") -Force -Encoding UTF8
+                $outFile = Join-Path $desk "WINDOWS11_REBOOT_REQUIRED.txt"
+                $notice | Out-File -FilePath $outFile -Encoding utf8 -Force
             }
-        } catch { }
-    }
+        }
+    } Catch { Log "Failed to write desktop notices: $_" }
 
-    # Create scheduled task which runs every 30 minutes and attempts to reboot if no interactive users
-    $scriptCheck = @"
-`$active = (quser 2>`$null) -join ''
+    # Create reboot-check script
+    $rebootScriptContent = @"
+`$active = (& quser 2>`$null) -join ''
 if ([string]::IsNullOrWhiteSpace(`$active)) {
+    # no users - reboot with 60s countdown so we have a chance to cancel if needed
     shutdown /r /t 60 /c `"Rebooting now to finish Windows 11 upgrade.`"
-} else {
-    # still users - do nothing
 }
 "@
-    $checkPath = Join-Path $UpgradeFolder "reboot-check.ps1"
-    $scriptCheck | Out-File -FilePath $checkPath -Encoding ascii -Force
-    $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$checkPath`""
-    $trigger = New-ScheduledTaskTrigger -RepetitionInterval (New-TimeSpan -Minutes 30) -Once -At (Get-Date).AddMinutes(1)
-    Register-ScheduledTask -TaskName $ScheduledRebootCheckName -Action $action -Trigger $trigger -RunLevel Highest -Force
-    Log "Registered scheduled reboot-check task $ScheduledRebootCheckName (every 30 minutes)."
+    Try {
+        $rebootScriptContent | Out-File -FilePath $RebootCheckScript -Encoding ascii -Force
+        Log "Wrote reboot-check script to $RebootCheckScript"
+        # Register scheduled task to run every $RebootCheckMinutes
+        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$RebootCheckScript`""
+        $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)
+        $trigger.RepetitionInterval = (New-TimeSpan -Minutes $RebootCheckMinutes)
+        $trigger.RepetitionDuration = ([TimeSpan]::MaxValue)
+        Register-ScheduledTask -TaskName $ScheduledRebootCheckName -Action $action -Trigger $trigger -RunLevel Highest -Force | Out-Null
+        Log "Registered scheduled task $ScheduledRebootCheckName to run every $RebootCheckMinutes minutes."
+    } Catch { Log "Failed to register reboot-check scheduled task: $_" }
 }
 
-# --- schedule cleanup to run after next boot if installer will reboot the machine ---
-# create cleanup script that runs once at boot and checks Windows version; if upgraded -> perform final cleanup.
-$cleanupScript = @"
-# Cleanup script for Win11 upgrade orchestrator
-Start-Sleep -Seconds 30
-# Check if upgrade completed by checking product name
-try {
+# --- Register cleanup script to run at startup once; it will verify Windows edition and cleanup if Win11 present ---
+$cleanupScriptContent = @"
+# post-upgrade cleanup script - safe to run multiple times
+Start-Sleep -Seconds 20
+Try {
     `$prod = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue).ProductName
-} catch {
-    `$prod = ''
-}
-if (`$prod -match 'Windows 11') {
-    # remove staged folder and tasks and temp user if desired
-    Remove-Item -LiteralPath '$UpgradeFolder' -Recurse -Force -ErrorAction SilentlyContinue
-    schtasks /Delete /TN `"$ScheduledRebootCheckName`" /F 2> $null
-    schtasks /Delete /TN `"$ScheduledRunNowName`" /F 2> $null
-    # remove this scheduled task (self)
-    schtasks /Delete /TN `"$ScheduledCleanupName`" /F 2> $null
-    # delete temp admin
-    if ($CreateTempAdmin) {
-        try {
-            net user $TempAdminName /delete 2>$null
-        } catch {}
+} Catch { `$prod = '' }
+# Only perform cleanup if it looks like Windows 11
+if (`$prod -and `$prod -match 'Windows 11') {
+    Try {
+        # remove staged folder
+        Remove-Item -LiteralPath '$UpgradeFolder' -Recurse -Force -ErrorAction SilentlyContinue
+    } Catch {}
+    Try { schtasks /Delete /TN `"$ScheduledRebootCheckName`" /F 2> $null } Catch {}
+    Try { schtasks /Delete /TN `"$ScheduledRunNowName`" /F 2> $null } Catch {}
+    Try { schtasks /Delete /TN `"$ScheduledCleanupName`" /F 2> $null } Catch {}
+    # delete temp admin if it exists
+    if ('$UseTempAdmin' -eq 'True') {
+        try { net user $TempAdminName /delete 2>$null } catch {}
     }
 }
 "@
-$cleanupPath = Join-Path $UpgradeFolder "post-upgrade-cleanup.ps1"
-$cleanupScript | Out-File -FilePath $cleanupPath -Encoding ascii -Force
-# register scheduled task to run at startup once
-$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$cleanupPath`""
-$trigger = New-ScheduledTaskTrigger -AtStartup
-Register-ScheduledTask -TaskName $ScheduledCleanupName -Action $action -Trigger $trigger -RunLevel Highest -Force
-Log "Registered cleanup-at-startup task $ScheduledCleanupName."
+Try {
+    $cleanupScriptContent | Out-File -FilePath $PostCleanupScript -Encoding ascii -Force
+    Log "Wrote post-upgrade cleanup script to $PostCleanupScript"
+    # Register a scheduled task at startup to run cleanup once
+    $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$PostCleanupScript`""
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+    Register-ScheduledTask -TaskName $ScheduledCleanupName -Action $action -Trigger $trigger -RunLevel Highest -Force | Out-Null
+    Log "Registered startup cleanup scheduled task $ScheduledCleanupName."
+} Catch { Log "Failed to register cleanup task: $_" }
 
-Log "Upgrade orchestration complete. Installer running. See logs in $LogFile."
-
+Log "Installer started and orchestration complete. Check logs: $LogFile"
 Exit 0
