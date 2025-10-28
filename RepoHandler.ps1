@@ -1,57 +1,83 @@
 # RepoHandler.ps1
-# Self-contained version for C:\Win11Upgrade
-# Handles downloading repo, scheduling upgrade + cleanup
-
 $Root = "C:\Win11Upgrade"
-$RepoUrl = "https://api.github.com/repos/sctcoder1/WIN11-inplace/zipball/main"
-$Zip = "$Root\repo.zip"
-$Token = "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"  # <--- Place token here
-$Headers = @{ Authorization = "token $Token" }
+$RepoZipUrl = "https://api.github.com/repos/sctcoder1/project-711-d/zipball/main"
+$Zip = Join-Path $Root "repo.zip"
+$Log = Join-Path $Root "RepoHandler.log"
 $User = "WinUpgTemp"
-$Log = "$Root\RepoHandler.log"
 
-function Log($msg){ ("[$(Get-Date)] $msg") | Out-File $Log -Append }
+function Log { param($m) ("[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $m") | Out-File $Log -Append }
 
-Log "Starting RepoHandler."
+Log "RepoHandler started."
 
-# --- Check for existing extraction ---
-$Existing = Get-ChildItem $Root -Directory | Where-Object Name -like "*WIN11-inplace*" | Select-Object -First 1
+# If repo already extracted, skip download
+$Existing = Get-ChildItem -Path $Root -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'project-711-d' } | Select-Object -First 1
 if ($Existing) {
-    Log "Repo already exists at $($Existing.FullName). Skipping download."
+    Log "Repo already extracted at $($Existing.FullName). Skipping download."
     $WorkDir = $Existing.FullName
 } else {
-    if (Test-Path $Zip) { Log "Removing old zip..."; Remove-Item $Zip -Force }
-    Log "Downloading repo ZIP from GitHub..."
-    Invoke-WebRequest -Uri $RepoUrl -Headers $Headers -OutFile $Zip -UseBasicParsing
-    Log "Extracting..."
-    Expand-Archive -Path $Zip -DestinationPath $Root -Force
-    Remove-Item $Zip -Force
-    $WorkDir = (Get-ChildItem $Root -Directory | Where-Object Name -like "*WIN11-inplace*" | Select-Object -First 1).FullName
-    Log "Extraction complete: $WorkDir"
+    if (Test-Path $Zip) { Log "Removing stale zip..."; Remove-Item $Zip -Force -ErrorAction SilentlyContinue }
+    Log "Downloading repo zip..."
+    try {
+        Invoke-WebRequest -Uri $RepoZipUrl -OutFile $Zip -UseBasicParsing -TimeoutSec 0
+    } catch {
+        Log "ERROR downloading repo: $_"
+        exit 1
+    }
+    Log "Extracting zip..."
+    try {
+        Expand-Archive -Path $Zip -DestinationPath $Root -Force
+        Remove-Item $Zip -Force -ErrorAction SilentlyContinue
+        $WorkDir = Get-ChildItem -Path $Root -Directory | Where-Object { $_.Name -match 'project-711-d' } | Select-Object -First 1
+        if (-not $WorkDir) { Log "ERROR: Extracted folder not found."; exit 1 }
+        $WorkDir = $WorkDir.FullName
+    } catch {
+        Log "ERROR extracting repo: $_"
+        exit 1
+    }
+    Log "Repo extracted to $WorkDir"
 }
 
-# --- Schedule main upgrade BAT ---
+# Ensure expected files exist
 $Bat = Join-Path $WorkDir "Win11_Upgrade.bat"
+if (-not (Test-Path $Bat)) { Log "ERROR: Win11_Upgrade.bat not found in repo ($Bat)"; exit 1 }
+
+# Schedule Win11_Upgrade task (only if not present)
 if (-not (Get-ScheduledTask -TaskName "Win11_Upgrade" -ErrorAction SilentlyContinue)) {
-    Log "Scheduling Win11_Upgrade.bat..."
-    $act = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c start /min `"$Bat`""
-    $trg = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddSeconds(30))
-    $prn = New-ScheduledTaskPrincipal -UserId $User -RunLevel Highest
-    Register-ScheduledTask -TaskName "Win11_Upgrade" -Action $act -Trigger $trg -Principal $prn -Force | Out-Null
-    Start-ScheduledTask -TaskName "Win11_Upgrade"
+    Log "Scheduling Win11_Upgrade to run as $User..."
+    $action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c start /min `"$Bat`""
+    $trigger = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddSeconds(30))
+    $principal = New-ScheduledTaskPrincipal -UserId $User -RunLevel Highest
+    try {
+        Register-ScheduledTask -TaskName "Win11_Upgrade" -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
+        Start-ScheduledTask -TaskName "Win11_Upgrade"
+        Log "Win11_Upgrade scheduled and started."
+    } catch {
+        Log "ERROR scheduling Win11_Upgrade: $_"
+        exit 1
+    }
 } else {
-    Log "Win11_Upgrade task already exists. Skipping scheduling."
+    Log "Win11_Upgrade task already exists. Skipping."
 }
 
-# --- Schedule cleanup on startup ---
+# Schedule cleanup at startup (if not already)
 $CleanupBat = Join-Path $WorkDir "Cleanup.bat"
-if (-not (Get-ScheduledTask -TaskName "Win11_Cleanup" -ErrorAction SilentlyContinue)) {
-    Log "Scheduling Win11_Cleanup.bat..."
-    $act2 = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c start /min `"$CleanupBat`""
-    $trg2 = New-ScheduledTaskTrigger -AtStartup
-    Register-ScheduledTask -TaskName "Win11_Cleanup" -Action $act2 -Trigger $trg2 -RunLevel Highest -Force | Out-Null
+if (Test-Path $CleanupBat) {
+    if (-not (Get-ScheduledTask -TaskName "Win11_Cleanup" -ErrorAction SilentlyContinue)) {
+        Log "Scheduling Win11_Cleanup at startup..."
+        $action2 = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c start /min `"$CleanupBat`""
+        $trigger2 = New-ScheduledTaskTrigger -AtStartup
+        try {
+            Register-ScheduledTask -TaskName "Win11_Cleanup" -Action $action2 -Trigger $trigger2 -RunLevel Highest -Force | Out-Null
+            Log "Win11_Cleanup scheduled."
+        } catch {
+            Log "ERROR scheduling Win11_Cleanup: $_"
+        }
+    } else {
+        Log "Win11_Cleanup task already exists. Skipping."
+    }
 } else {
-    Log "Cleanup task already exists. Skipping scheduling."
+    Log "WARNING: Cleanup.bat not found in repo; skipping cleanup scheduling."
 }
 
-Log "RepoHandler complete. Exiting."
+Log "RepoHandler complete."
+exit 0
