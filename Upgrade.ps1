@@ -1,6 +1,6 @@
 # ==============================================================
 # Upgrade.ps1 – Windows 10 → 11 Fully Silent In-Place Upgrade
-# Safe extraction (no Mount-DiskImage required)
+# Reliable ISO mount and extraction method
 # ==============================================================
 
 [CmdletBinding()]
@@ -34,7 +34,7 @@ function Ensure-Folder { param($Path) if (-not (Test-Path $Path)) { New-Item -It
 Ensure-Folder $Root
 Log "Upgrade.ps1 started."
 
-# --- Locate repo (for optional cleanup later) ---
+# --- Locate repo (optional for cleanup) ---
 try {
     $RepoDir = (Get-ChildItem -Path $Root -Directory -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -match '^project-711-d' } | Select-Object -First 1).FullName
@@ -55,37 +55,41 @@ if (-not (Test-Path $IsoFile)) {
     Log "ISO already present; skipping download."
 }
 
-# --- Extract setup files safely ---
+# --- Extract setup files from ISO (robust mount version) ---
 Ensure-Folder $SetupDir
 $SetupExe = Join-Path $SetupDir "setup.exe"
 
 if (-not (Test-Path $SetupExe)) {
-    Log "Extracting ISO contents without mounting..."
+    Log "Mounting ISO..."
     try {
-        Expand-Archive -Path $IsoFile -DestinationPath $SetupDir -Force -ErrorAction Stop
-        Log "ISO extracted successfully using Expand-Archive."
-    } catch {
-        Log "Expand-Archive failed: $($_.Exception.Message)"
-        Log "Attempting DISM or 7-Zip fallback..."
+        $disk = Mount-DiskImage -ImagePath $IsoFile -PassThru -ErrorAction Stop
+        Log "ISO mounted successfully. Waiting for volume..."
+        $driveLetter = $null
 
-        # DISM fallback (if ISO is a real WIM image)
-        try {
-            dism /Mount-Image /ImageFile:$IsoFile /MountDir:$SetupDir /ReadOnly | Out-Null
-            Log "DISM mount successful (read-only)."
-        } catch {
-            # Optional 7-Zip fallback if installed
-            $SevenZip = "C:\Program Files\7-Zip\7z.exe"
-            if (Test-Path $SevenZip) {
-                try {
-                    & $SevenZip x $IsoFile "-o$SetupDir" -y | Out-Null
-                    Log "ISO extracted successfully using 7-Zip fallback."
-                } catch {
-                    Fail "7-Zip extraction failed: $($_.Exception.Message)"
-                }
-            } else {
-                Fail "No valid extraction method available (Expand-Archive, DISM, 7-Zip all failed)."
+        # Retry loop to ensure the volume is ready
+        for ($i = 1; $i -le 15; $i++) {
+            $vol = $disk | Get-Volume -ErrorAction SilentlyContinue
+            if ($vol -and $vol.DriveLetter) {
+                $driveLetter = $vol.DriveLetter
+                break
             }
+            Start-Sleep -Seconds 2
         }
+
+        if (-not $driveLetter) {
+            Fail "Timeout waiting for ISO volume — could not detect drive letter."
+        }
+
+        $src = "$driveLetter`:"
+        Log "Copying setup files from $src to $SetupDir..."
+        Ensure-Folder $SetupDir
+        robocopy $src $SetupDir /E /NFL /NDL /NJH /NJS /NP | Out-Null
+        Log "Setup files copied successfully."
+
+        Dismount-DiskImage -ImagePath $IsoFile -ErrorAction SilentlyContinue
+        Log "ISO dismounted."
+    } catch {
+        Fail "ISO mount or copy failed: $($_.Exception.Message)"
     }
 } else {
     Log "Setup files already available at $SetupDir."
