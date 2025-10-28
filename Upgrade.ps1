@@ -83,16 +83,35 @@ if ($NoUser) {
     $Arguments = "/auto upgrade /compat IgnoreWarning /dynamicupdate disable /showoobe none /Telemetry Disable /eula Accept /unattend `"$SetupCfg`" /noreboot"
 }
 
-# --- Run setup.exe (interactive) ---
+# --- Run setup.exe (interactive-safe) ---
 Log "Starting setup.exe..."
+
 try {
     Log "Arguments: $Arguments"
-    Start-Process -FilePath $SetupExe -ArgumentList $Arguments -WorkingDirectory $SetupDir
-    Log "setup.exe launched visibly (no /quiet)."
-} catch {
+    $ServiceUI = "C:\Win11Upgrade\ServiceUI.exe"
+
+    # Detect if anyone is logged in interactively
+    $explorerProc = Get-WmiObject Win32_Process -Filter "Name='explorer.exe'" -ErrorAction SilentlyContinue
+    $ActiveUser = if ($explorerProc) { ($explorerProc.GetOwner()).User } else { $null }
+
+    if ((Test-Path $ServiceUI) -and $ActiveUser) {
+        Log "Active user '$ActiveUser' detected — launching setup.exe via ServiceUI..."
+        Start-Process -FilePath $ServiceUI -ArgumentList "-Process:explorer.exe `"$SetupExe`" $Arguments" -WorkingDirectory $SetupDir
+    }
+    else {
+        if (-not $ActiveUser) { Log "No interactive user detected — running setup silently." }
+        elseif (-not (Test-Path $ServiceUI)) { Log "ServiceUI.exe not found — running setup normally." }
+
+        Start-Process -FilePath $SetupExe -ArgumentList $Arguments -WorkingDirectory $SetupDir
+    }
+
+    Log "setup.exe launched (detached)."
+}
+catch {
     Log "ERROR running setup.exe: $($_.Exception.Message)"
     exit 1
 }
+
 
 # --- Schedule cleanup after reboot ---
 $CleanupBat = Join-Path $RepoDir "Cleanup.bat"
