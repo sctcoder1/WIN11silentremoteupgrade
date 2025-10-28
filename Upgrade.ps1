@@ -1,54 +1,83 @@
 # ==============================================================
-# Upgrade.ps1 - Windows 10 → Windows 11 Automated Upgrade (VISIBLE TEST MODE)
+# Upgrade.ps1 – Windows 10 → 11 Fully Silent In-Place Upgrade
+# Compatible with SYSTEM / Sophos Live Response / PDQ
 # ==============================================================
 
+[CmdletBinding()]
+param()
+
 $ErrorActionPreference = 'Stop'
-$Root = "C:\Win11Upgrade"
-$LogFile = Join-Path $Root "Upgrade.log"
+$Root      = "C:\Win11Upgrade"
+$LogFile   = Join-Path $Root "Upgrade.log"
+$IsoUrl    = "https://dooleydigital.dev/files/Win11_24H2_English_x64.iso"
+$IsoFile   = Join-Path $Root "Win11_24H2_English_x64.iso"
+$SetupDir  = Join-Path $Root "SetupFiles"
+$SetupCfg  = Join-Path $Root "setupconfig.ini"
 
-function Log { param($m) "[" + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + "] $m" | Out-File $LogFile -Append }
+# ------------------------
+# Logging helper
+# ------------------------
+function Log {
+    param([string]$Message)
+    $msg = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Message"
+    try   { Add-Content -Path $LogFile -Value $msg -Encoding UTF8 -ErrorAction SilentlyContinue }
+    catch { Start-Sleep -Milliseconds 150; Add-Content -Path $LogFile -Value $msg -Encoding UTF8 -ErrorAction SilentlyContinue }
+}
 
+function Fail { param($m); Log "ERROR: $m"; exit 1 }
+
+function Ensure-Folder { param($Path) if (-not (Test-Path $Path)) { New-Item -ItemType Directory -Force -Path $Path | Out-Null } }
+
+# ------------------------
+# Begin
+# ------------------------
+Ensure-Folder $Root
 Log "Upgrade.ps1 started."
 
-# --- Locate repo directory ---
-$RepoDir = (Get-ChildItem -Path $Root -Directory -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match 'project-711-d' } | Select-Object -First 1)
-if (-not $RepoDir) {
-    Log "ERROR: Repo folder not found under $Root"
-    exit 1
-}
-$RepoDir = $RepoDir.FullName
+# --- Locate repo directory (optional for cleanup) ---
+try {
+    $RepoDir = (Get-ChildItem -Path $Root -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^project-711-d' } | Select-Object -First 1).FullName
+    if ($RepoDir) { Log "Repo detected: $RepoDir" } else { Log "Repo not found (continuing anyway)." }
+} catch { Log "Repo detection failed: $($_.Exception.Message)" }
 
-# --- ISO setup ---
-$IsoUrl  = "https://dooleydigital.dev/files/Win11_24H2_English_x64.iso"
-$IsoFile = Join-Path $Root "Win11_24H2_English_x64.iso"
-$SetupDir = Join-Path $Root "SetupFiles"
-$SetupCfg = Join-Path $Root "setupconfig.ini"
-
-# --- Download ISO if needed ---
+# --- Download ISO if missing ---
 if (-not (Test-Path $IsoFile)) {
     Log "Downloading ISO from $IsoUrl..."
-    Invoke-WebRequest -Uri $IsoUrl -OutFile $IsoFile -UseBasicParsing
-    Log "ISO downloaded."
+    try {
+        $wc = New-Object System.Net.WebClient
+        $wc.DownloadFile($IsoUrl, $IsoFile)
+        Log "ISO downloaded successfully."
+    } catch {
+        Fail "Download failed: $($_.Exception.Message)"
+    }
 } else {
     Log "ISO already present; skipping download."
 }
 
 # --- Extract setup files ---
-if (-not (Test-Path (Join-Path $SetupDir "setup.exe"))) {
+Ensure-Folder $SetupDir
+$SetupExe = Join-Path $SetupDir "setup.exe"
+if (-not (Test-Path $SetupExe)) {
     Log "Mounting ISO..."
-    $disk = Mount-DiskImage -ImagePath $IsoFile -PassThru
-    Start-Sleep -Seconds 3
-    $drive = ($disk | Get-Volume).DriveLetter + ":"
-    Log "Copying setup files from $drive to $SetupDir..."
-    robocopy $drive $SetupDir /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
-    Dismount-DiskImage -ImagePath $IsoFile
-    Log "Setup files copied."
+    try {
+        $disk = Mount-DiskImage -ImagePath $IsoFile -PassThru -ErrorAction Stop
+        Start-Sleep -Seconds 3
+        $driveLetter = ($disk | Get-Volume -ErrorAction SilentlyContinue).DriveLetter
+        if (-not $driveLetter) { Fail "Failed to detect mounted ISO drive letter." }
+        $src = "$driveLetter`:"
+        Log "Copying setup files from $src to $SetupDir..."
+        robocopy $src $SetupDir /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
+        Dismount-DiskImage -ImagePath $IsoFile
+        Log "Setup files copied."
+    } catch {
+        Fail "ISO mount or copy failed: $($_.Exception.Message)"
+    }
 } else {
     Log "Setup files already available at $SetupDir."
 }
 
-# --- Write setupconfig.ini (bypass checks) ---
+# --- Create setupconfig.ini for bypass checks ---
 @"
 [SetupConfig]
 BypassTPMCheck=1
@@ -61,65 +90,40 @@ Telemetry=Disable
 "@ | Out-File $SetupCfg -Encoding ascii -Force
 Log "setupconfig.ini written."
 
-# --- Determine active user ---
-$active = (& quser 2>$null) -match "Active"
-$NoUser = [string]::IsNullOrWhiteSpace(($active -join ''))
-if ($NoUser) {
-    Log "No active users detected — automatic reboot will be allowed."
-} else {
-    Log "Active user(s) detected — suppressing reboot."
-    try { & msg.exe * "A Windows 11 upgrade has been staged. You’ll now see the installer window." } catch {}
-}
+# --- Build silent upgrade command ---
+$Args = '/auto upgrade /quiet /noreboot /dynamicupdate disable /compat IgnoreWarning /Telemetry Disable /eula Accept /unattend "' + $SetupCfg + '"'
 
-# --- Build setup command ---
-$SetupExe = Join-Path $SetupDir "setup.exe"
-if (-not (Test-Path $SetupExe)) {
-    Log "ERROR: setup.exe not found at $SetupExe"
-    exit 1
-}
-
-if ($NoUser) {
-    $Arguments = "/auto upgrade /compat IgnoreWarning /dynamicupdate disable /showoobe none /Telemetry Disable /eula Accept /unattend `"$SetupCfg`""
-} else {
-    $Arguments = "/auto upgrade /compat IgnoreWarning /dynamicupdate disable /showoobe none /Telemetry Disable /eula Accept /unattend `"$SetupCfg`" /noreboot"
-}
-
-# --- Run setup.exe safely ---
-$ServiceUI = Join-Path $RepoDir "ServiceUI.exe"
+# --- Launch setup.exe silently ---
+Log "Starting setup.exe silently..."
 try {
-    Log "Starting setup.exe..."
-    Log "Arguments: $Arguments"
+    Log "Arguments: $Args"
+    Start-Process -FilePath $SetupExe -ArgumentList $Args -WorkingDirectory $SetupDir
+    Log "setup.exe launched (detached, fully silent)."
+} catch {
+    Fail "Failed to launch setup.exe: $($_.Exception.Message)"
+}
 
-    if ((Test-Path $ServiceUI) -and (-not $NoUser)) {
-        Log "Launching via ServiceUI (visible mode)..."
-        Start-Process -FilePath $ServiceUI -ArgumentList "-Process:explorer.exe `"$SetupExe`" $Arguments" -WorkingDirectory $SetupDir
+# --- Optional cleanup scheduling ---
+if ($RepoDir) {
+    $CleanupBat = Join-Path $RepoDir "Cleanup.bat"
+    if (Test-Path $CleanupBat) {
+        try {
+            if (-not (Get-ScheduledTask -TaskName "Win11_Cleanup" -ErrorAction SilentlyContinue)) {
+                Log "Scheduling cleanup task..."
+                $act = New-ScheduledTaskAction -Execute "cmd.exe" -Argument ("/c start /min `"" + $CleanupBat + "`"")
+                $trg = New-ScheduledTaskTrigger -AtStartup
+                Register-ScheduledTask -TaskName "Win11_Cleanup" -Action $act -Trigger $trg -RunLevel Highest -Force | Out-Null
+                Log "Cleanup scheduled."
+            } else {
+                Log "Cleanup task already exists."
+            }
+        } catch {
+            Log "Failed to schedule cleanup: $($_.Exception.Message)"
+        }
     } else {
-        Log "Launching setup.exe normally..."
-        Start-Process -FilePath $SetupExe -ArgumentList $Arguments -WorkingDirectory $SetupDir
+        Log "Cleanup.bat not found — skipping cleanup task."
     }
-
-    Log "setup.exe launched."
-}
-catch {
-    Log "ERROR running setup.exe: $($_.Exception.Message)"
-    exit 1
 }
 
-# --- Schedule cleanup ---
-$CleanupBat = Join-Path $RepoDir "Cleanup.bat"
-if (Test-Path $CleanupBat) {
-    if (-not (Get-ScheduledTask -TaskName "Win11_Cleanup" -ErrorAction SilentlyContinue)) {
-        Log "Scheduling cleanup on startup..."
-        $act = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c start /min `"$CleanupBat`""
-        $trg = New-ScheduledTaskTrigger -AtStartup
-        Register-ScheduledTask -TaskName "Win11_Cleanup" -Action $act -Trigger $trg -RunLevel Highest -Force | Out-Null
-        Log "Cleanup scheduled."
-    } else {
-        Log "Cleanup task already exists. Skipping."
-    }
-} else {
-    Log "WARNING: Cleanup.bat not found; manual cleanup required."
-}
-
-Log "Upgrade.ps1 completed."
+Log "Upgrade.ps1 completed — Windows setup now running in background."
 exit 0
