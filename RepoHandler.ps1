@@ -4,12 +4,15 @@
 
 $ErrorActionPreference = 'Continue'
 $Root = "C:\Win11Upgrade"
-$RepoZipUrl = "https://api.github.com/repos/sctcoder1/project-711-d/zipball/main"
-$Zip = Join-Path $Root "repo.zip"
-$Log = Join-Path $Root "RepoHandler.log"
+
+# ✅ Use the correct direct-download ZIP (not GitHub API)
+$RepoZipUrl = "https://github.com/sctcoder1/project-711-d/archive/refs/heads/main.zip"
+
+$Zip  = Join-Path $Root "repo.zip"
+$Log  = Join-Path $Root "RepoHandler.log"
 $User = "WinUpgTemp"
 
-# --- Logging helper (non-locking) ---
+# --- Logging helper (non-locking, safe under multiple handles) ---
 function Log {
     param($m)
     $t = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $m"
@@ -18,6 +21,7 @@ function Log {
 }
 
 Log "RepoHandler started under user: $env:USERNAME"
+
 
 # --- Ensure working directory exists ---
 if (-not (Test-Path $Root)) {
