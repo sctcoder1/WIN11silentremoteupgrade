@@ -78,6 +78,7 @@ Log "setupconfig.ini written."
 # --- Determine if an interactive user is logged in ---
 $active = (& quser 2>$null) -match "Active"
 $NoUser = [string]::IsNullOrWhiteSpace(($active -join ''))
+
 if ($NoUser) {
     Log "No active users detected — using auto reboot mode."
     $Arguments = "/auto upgrade /quiet /compat IgnoreWarning /dynamicupdate disable /showoobe none /Telemetry Disable /eula Accept /unattend `"$SetupCfg`""
@@ -107,12 +108,10 @@ try {
     if ((Test-Path $ServiceUI) -and $ActiveUser) {
         Log "Active user '$ActiveUser' detected — launching setup.exe via ServiceUI..."
         Start-Process -FilePath $ServiceUI -ArgumentList "-Process:explorer.exe `"$SetupExe`" $Arguments" -WorkingDirectory $SetupDir
-    }
-    elseif (-not $ActiveUser) {
+    } elseif (-not $ActiveUser) {
         Log "No interactive user detected — running setup silently."
         Start-Process -FilePath $SetupExe -ArgumentList $Arguments -WorkingDirectory $SetupDir
-    }
-    elseif (-not (Test-Path $ServiceUI)) {
+    } elseif (-not (Test-Path $ServiceUI)) {
         Log "ServiceUI.exe not found — running setup normally."
         Start-Process -FilePath $SetupExe -ArgumentList $Arguments -WorkingDirectory $SetupDir
     }
