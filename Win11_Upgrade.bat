@@ -1,24 +1,22 @@
 @echo off
-title Windows 11 In-Place Upgrade (TempUser Safe Copy Mode)
+title Windows 11 Modular Upgrade Launcher
 color 0A
 setlocal enableextensions
 
-echo.
-echo ============================================================
-echo   Windows 11 Upgrade - Automated Installer (TempUser Mode)
-echo ============================================================
-echo.
-
-:: --- Core paths ---
 set "root=C:\Win11Upgrade"
 set "repo=%root%\project-711-d"
 set "backup=C:\project-711-d"
 set "log=%root%\UpgradeLauncher.log"
 
-:: --- Start logging ---
+echo.
+echo ============================================================
+echo   Windows 11 Modular Upgrade Launcher
+echo ============================================================
+echo.
+
 (
 echo [INFO] ============================================================
-echo [INFO] Starting Upgrade.bat at %date% %time%
+echo [INFO] Starting UpgradeLauncher at %date% %time%
 echo [INFO] Root Folder: %root%
 echo [INFO] Repo Folder: %repo%
 echo [INFO] Backup Folder: %backup%
@@ -26,53 +24,63 @@ echo [INFO] ============================================================
 echo.
 ) > "%log%"
 
-:: --- Verify repo folder ---
-if not exist "%repo%\" (
-    echo [ERROR] Repo folder not found at "%repo%"
-    echo [ERROR] Repo folder not found at "%repo%" >> "%log%"
+:: ---------------------------------------------------------------------
+:: 1️⃣ Copy repo for safety
+:: ---------------------------------------------------------------------
+if exist "%repo%\" (
+    echo [INFO] Copying repo to "%backup%"... | tee -a "%log%"
+    robocopy "%repo%" "%backup%" /MIR /NFL /NDL /NJH /NJS /NP >> "%log%" 2>&1
+    echo [INFO] Repo copy done (errorlevel %errorlevel%) >> "%log%"
+) else (
+    echo [ERROR] Repo folder missing at "%repo%" >> "%log%"
+    echo [ERROR] Repo folder missing at "%repo%"
     exit /b 1
 )
 
-echo [INFO] Found repo folder. >> "%log%"
-echo [INFO] Found repo folder.
-
-:: --- Ensure Win11Upgrade root exists ---
-if not exist "%root%\" (
-    echo [INFO] Creating %root%...
-    mkdir "%root%" >> "%log%" 2>&1
+:: ---------------------------------------------------------------------
+:: 2️⃣ Run Download-ISO.ps1
+:: ---------------------------------------------------------------------
+echo [INFO] Running Stage 1: Download-ISO.ps1 >> "%log%"
+powershell -ExecutionPolicy Bypass -NoProfile -File "%repo%\Download-ISO.ps1" >> "%log%" 2>&1
+if %errorlevel% NEQ 0 (
+    echo [ERROR] Stage 1 (Download-ISO.ps1) failed. >> "%log%"
+    exit /b %errorlevel%
 )
 
-:: --- Copy repo to root (safety fallback) ---
-echo [INFO] Copying repo to "%backup%"...
-echo [INFO] Copying repo to "%backup%"... >> "%log%"
-robocopy "%repo%" "%backup%" /MIR /NFL /NDL /NJH /NJS /NP >> "%log%" 2>&1
-
-if %errorlevel% GEQ 8 (
-    echo [WARNING] robocopy returned errorlevel %errorlevel% (non-fatal)
-    echo [WARNING] robocopy returned errorlevel %errorlevel% (non-fatal) >> "%log%"
-) else (
-    echo [INFO] Repo copy completed successfully.
-    echo [INFO] Repo copy completed successfully. >> "%log%"
+:: ---------------------------------------------------------------------
+:: 3️⃣ Run Extract-ISO.ps1
+:: ---------------------------------------------------------------------
+echo [INFO] Running Stage 2: Extract-ISO.ps1 >> "%log%"
+powershell -ExecutionPolicy Bypass -NoProfile -File "%repo%\Extract-ISO.ps1" >> "%log%" 2>&1
+if %errorlevel% NEQ 0 (
+    echo [ERROR] Stage 2 (Extract-ISO.ps1) failed. >> "%log%"
+    exit /b %errorlevel%
 )
 
-:: --- Launch PowerShell upgrade script directly ---
-echo. >> "%log%"
-echo [INFO] Launching PowerShell Upgrade.ps1... >> "%log%"
-echo [INFO] Launching PowerShell Upgrade.ps1...
-echo ------------------------------------------------------------ >> "%log%"
+:: ---------------------------------------------------------------------
+:: 4️⃣ Run Launch-Upgrade.ps1
+:: ---------------------------------------------------------------------
+echo [INFO] Running Stage 3: Launch-Upgrade.ps1 >> "%log%"
+powershell -ExecutionPolicy Bypass -NoProfile -File "%repo%\Launch-Upgrade.ps1" >> "%log%" 2>&1
+if %errorlevel% NEQ 0 (
+    echo [ERROR] Stage 3 (Launch-Upgrade.ps1) failed. >> "%log%"
+    exit /b %errorlevel%
+)
 
-powershell -ExecutionPolicy Bypass -NoProfile -File "%repo%\Upgrade.ps1" >> "%log%" 2>&1
-
-echo ------------------------------------------------------------ >> "%log%"
-echo [INFO] PowerShell Upgrade.ps1 completed. >> "%log%"
-echo [INFO] Logs available at %log% and %root%\Upgrade.log >> "%log%"
+:: ---------------------------------------------------------------------
+:: ✅ Done
+:: ---------------------------------------------------------------------
+echo [INFO] ============================================================ >> "%log%"
+echo [INFO] Upgrade process triggered successfully. >> "%log%"
+echo [INFO] Windows setup should now be running silently. >> "%log%"
+echo [INFO] ============================================================ >> "%log%"
 
 echo.
 echo ============================================================
-echo   Upgrade script complete. Check:
-echo   %log%
-echo   and %root%\Upgrade.log
+echo   All stages executed.
+echo   Check "%log%" for details.
 echo ============================================================
+echo.
 
 endlocal
 exit /b 0
