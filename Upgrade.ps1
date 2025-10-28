@@ -108,10 +108,12 @@ try {
         Log "Active user '$ActiveUser' detected — launching setup.exe via ServiceUI..."
         Start-Process -FilePath $ServiceUI -ArgumentList "-Process:explorer.exe `"$SetupExe`" $Arguments" -WorkingDirectory $SetupDir
     }
-    else {
-        if (-not $ActiveUser) { Log "No interactive user detected — running setup silently." }
-        elseif (-not (Test-Path $ServiceUI)) { Log "ServiceUI.exe not found — running setup normally." }
-
+    elseif (-not $ActiveUser) {
+        Log "No interactive user detected — running setup silently."
+        Start-Process -FilePath $SetupExe -ArgumentList $Arguments -WorkingDirectory $SetupDir
+    }
+    elseif (-not (Test-Path $ServiceUI)) {
+        Log "ServiceUI.exe not found — running setup normally."
         Start-Process -FilePath $SetupExe -ArgumentList $Arguments -WorkingDirectory $SetupDir
     }
 
