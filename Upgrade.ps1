@@ -82,10 +82,21 @@ if (-not (Test-Path $SetupExe)) {
 
 Log "Starting setup.exe..."
 try {
-    Start-Process -FilePath $SetupExe -ArgumentList $Args -Wait
-    Log "setup.exe finished."
+    $SetupExe = Join-Path $SetupDir "setup.exe"
+    $Arguments = if ($NoUser) {
+        "/auto upgrade /quiet /compat IgnoreWarning /dynamicupdate Disable /showoobe none /Telemetry Disable /eula Accept /unattend `"$SetupCfg`""
+    } else {
+        "/auto upgrade /quiet /compat IgnoreWarning /dynamicupdate Disable /showoobe none /Telemetry Disable /eula Accept /unattend `"$SetupCfg`" /noreboot"
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($Arguments)) {
+        Start-Process -FilePath $SetupExe -ArgumentList $Arguments -Wait
+        Log "Setup.exe executed successfully."
+    } else {
+        Log "ERROR: Argument list is empty — skipping setup."
+    }
 } catch {
-    Log "ERROR running setup.exe: $_"
+    Log "ERROR running setup.exe: $($_.Exception.Message)"
     exit 1
 }
 
