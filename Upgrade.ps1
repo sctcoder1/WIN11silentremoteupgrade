@@ -1,6 +1,6 @@
 # ==============================================================
-# Upgrade.ps1 – Windows 10 → 11 Fully Silent In-Place Upgrade
-# Reliable ISO mount and extraction method
+# Upgrade.ps1 – Windows 10 → 11 Fully Silent (No ISO Mount)
+# Works in restricted contexts such as Sophos Live Response
 # ==============================================================
 
 [CmdletBinding()]
@@ -9,96 +9,37 @@ param()
 $ErrorActionPreference = 'Stop'
 $Root      = "C:\Win11Upgrade"
 $LogFile   = Join-Path $Root "Upgrade.log"
-$IsoUrl    = "https://dooleydigital.dev/files/Win11_24H2_English_x64.iso"
-$IsoFile   = Join-Path $Root "Win11_24H2_English_x64.iso"
+$ZipUrl    = "https://dooleydigital.dev/files/Win11_24H2_SetupFiles.zip"
+$ZipFile   = Join-Path $Root "Win11_24H2_SetupFiles.zip"
 $SetupDir  = Join-Path $Root "SetupFiles"
 $SetupCfg  = Join-Path $Root "setupconfig.ini"
 
-# ------------------------
-# Logging + helpers
-# ------------------------
-function Log {
-    param([string]$Message)
-    $msg = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Message"
-    try   { Add-Content -Path $LogFile -Value $msg -Encoding UTF8 -ErrorAction SilentlyContinue }
-    catch { Start-Sleep -Milliseconds 150; Add-Content -Path $LogFile -Value $msg -Encoding UTF8 -ErrorAction SilentlyContinue }
-}
+function Log { param($m) Add-Content -Path $LogFile -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $m" -Encoding UTF8 }
+function Fail { param($m) Log "ERROR: $m"; exit 1 }
 
-function Fail { param($m); Log "ERROR: $m"; exit 1 }
-
-function Ensure-Folder { param($Path) if (-not (Test-Path $Path)) { New-Item -ItemType Directory -Force -Path $Path | Out-Null } }
-
-# ------------------------
-# Begin
-# ------------------------
-Ensure-Folder $Root
+# --- Ensure folders ---
+New-Item -ItemType Directory -Force -Path $Root,$SetupDir | Out-Null
 Log "Upgrade.ps1 started."
 
-# --- Locate repo (optional for cleanup) ---
-try {
-    $RepoDir = (Get-ChildItem -Path $Root -Directory -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match '^project-711-d' } | Select-Object -First 1).FullName
-    if ($RepoDir) { Log "Repo detected: $RepoDir" } else { Log "Repo not found (continuing anyway)." }
-} catch { Log "Repo detection failed: $($_.Exception.Message)" }
-
-# --- Download ISO if missing ---
-if (-not (Test-Path $IsoFile)) {
-    Log "Downloading ISO from $IsoUrl..."
+# --- Download pre-extracted setup files ---
+if (-not (Test-Path (Join-Path $SetupDir "setup.exe"))) {
+    Log "Downloading setup package from $ZipUrl..."
     try {
-        $wc = New-Object System.Net.WebClient
-        $wc.DownloadFile($IsoUrl, $IsoFile)
-        Log "ISO downloaded successfully."
+        Invoke-WebRequest -Uri $ZipUrl -OutFile $ZipFile -UseBasicParsing
+        Log "Extracting setup files..."
+        Expand-Archive -Path $ZipFile -DestinationPath $SetupDir -Force
+        Remove-Item $ZipFile -Force
+        Log "Setup files extracted successfully."
     } catch {
-        Fail "Download failed: $($_.Exception.Message)"
-    }
-} else {
-    Log "ISO already present; skipping download."
-}
-
-# --- Extract setup files from ISO (robust mount version) ---
-Ensure-Folder $SetupDir
-$SetupExe = Join-Path $SetupDir "setup.exe"
-
-if (-not (Test-Path $SetupExe)) {
-    Log "Mounting ISO..."
-    try {
-        $disk = Mount-DiskImage -ImagePath $IsoFile -PassThru -ErrorAction Stop
-        Log "ISO mounted successfully. Waiting for volume..."
-        $driveLetter = $null
-
-        # Retry loop to ensure the volume is ready
-        for ($i = 1; $i -le 15; $i++) {
-            $vol = $disk | Get-Volume -ErrorAction SilentlyContinue
-            if ($vol -and $vol.DriveLetter) {
-                $driveLetter = $vol.DriveLetter
-                break
-            }
-            Start-Sleep -Seconds 2
-        }
-
-        if (-not $driveLetter) {
-            Fail "Timeout waiting for ISO volume — could not detect drive letter."
-        }
-
-        $src = "$driveLetter`:"
-        Log "Copying setup files from $src to $SetupDir..."
-        Ensure-Folder $SetupDir
-        robocopy $src $SetupDir /E /NFL /NDL /NJH /NJS /NP | Out-Null
-        Log "Setup files copied successfully."
-
-        Dismount-DiskImage -ImagePath $IsoFile -ErrorAction SilentlyContinue
-        Log "ISO dismounted."
-    } catch {
-        Fail "ISO mount or copy failed: $($_.Exception.Message)"
+        Fail "Failed to download or extract setup package: $($_.Exception.Message)"
     }
 } else {
     Log "Setup files already available at $SetupDir."
 }
 
 # --- Validate setup.exe ---
-if (-not (Test-Path $SetupExe)) {
-    Fail "setup.exe still not found after extraction. Verify ISO integrity."
-}
+$SetupExe = Join-Path $SetupDir "setup.exe"
+if (-not (Test-Path $SetupExe)) { Fail "setup.exe not found after extraction." }
 Log "setup.exe located at $SetupExe."
 
 # --- Create setupconfig.ini (bypass checks) ---
@@ -114,39 +55,14 @@ Telemetry=Disable
 "@ | Out-File $SetupCfg -Encoding ascii -Force
 Log "setupconfig.ini written."
 
-# --- Build silent upgrade command ---
+# --- Build and run silent upgrade ---
 $Args = '/auto upgrade /quiet /noreboot /dynamicupdate disable /compat IgnoreWarning /Telemetry Disable /eula Accept /unattend "' + $SetupCfg + '"'
-
-# --- Launch setup.exe silently ---
 Log "Starting setup.exe silently..."
 try {
-    Log "Arguments: $Args"
     Start-Process -FilePath $SetupExe -ArgumentList $Args -WorkingDirectory $SetupDir
     Log "setup.exe launched (detached, fully silent)."
 } catch {
     Fail "Failed to launch setup.exe: $($_.Exception.Message)"
-}
-
-# --- Optional cleanup scheduling ---
-if ($RepoDir) {
-    $CleanupBat = Join-Path $RepoDir "Cleanup.bat"
-    if (Test-Path $CleanupBat) {
-        try {
-            if (-not (Get-ScheduledTask -TaskName "Win11_Cleanup" -ErrorAction SilentlyContinue)) {
-                Log "Scheduling cleanup on startup..."
-                $act = New-ScheduledTaskAction -Execute "cmd.exe" -Argument ("/c start /min `"" + $CleanupBat + "`"")
-                $trg = New-ScheduledTaskTrigger -AtStartup
-                Register-ScheduledTask -TaskName "Win11_Cleanup" -Action $act -Trigger $trg -RunLevel Highest -Force | Out-Null
-                Log "Cleanup scheduled."
-            } else {
-                Log "Cleanup task already exists."
-            }
-        } catch {
-            Log "Failed to schedule cleanup: $($_.Exception.Message)"
-        }
-    } else {
-        Log "Cleanup.bat not found — skipping cleanup task."
-    }
 }
 
 Log "Upgrade.ps1 completed — Windows setup now running in background."
