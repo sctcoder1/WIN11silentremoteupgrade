@@ -1,2 +1,2 @@
 @echo off
-powershell -ExecutionPolicy Bypass -File "C:\Windows\Temp\Win11Upgrade.ps1"
+powershell -ExecutionPolicy Bypass -File "C:\Win11Upgrade\Win11Upgrade.ps1"
