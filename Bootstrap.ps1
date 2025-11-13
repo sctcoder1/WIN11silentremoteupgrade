@@ -14,7 +14,7 @@ $taskName = "Win11Upgrade"
 schtasks /delete /tn $taskName /f 2>$null | Out-Null
 
 # Important: correct quoting so Task Scheduler parses properly
-$action = """cmd.exe"" /c ""$launcherBat"""
+$action = "C:\Win11Upgrade\Wind11launcher.bat"
 
 schtasks /create `
     /tn $taskName `
