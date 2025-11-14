@@ -1,62 +1,43 @@
-# Cleanup.ps1
-# Removes Win11Upgrade folder + scheduled tasks after successful upgrade
+# Safe Cleanup Script
+# Only runs if OS is Windows 11 AND upgrade folder exists
 
-$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Log = Join-Path $ScriptDir "Cleanup.log"
+$Log = "C:\Win11Upgrade\Cleanup.log"
+function Log { param($m) ("[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $m") | Out-File $Log -Append }
 
-function Log {
-    param($msg)
-    ("[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $msg") | Out-File $Log -Append
-}
-
-Start-Sleep -Seconds 10
 Log "Cleanup started."
 
+# Check OS version — must be Windows 11
 try {
-    # Detect OS version
-    $product = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion").ProductName
-    Log "Detected product: $product"
-
-    if ($product -match "Windows 11") {
-
-        # Remove upgrade working directory
-        $Root = "C:\Win11Upgrade"
-        if (Test-Path $Root) {
-            Log "Removing directory: $Root"
-            try {
-                Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction Stop
-                Log "Directory removed successfully."
-            } catch {
-                Log "Failed to remove directory: $_"
-            }
-        } else {
-            Log "Directory not found: $Root"
-        }
-
-        # Remove only the tasks YOU create
-        $TasksToRemove = @(
-            "Win11Upgrade",
-            "Win11Reboot",
-            "Win11Cleanup"
-        )
-
-        foreach ($task in $TasksToRemove) {
-            try {
-                schtasks /Delete /TN $task /F > $null 2>&1
-                Log "Removed scheduled task: $task"
-            } catch {
-                Log "Task $task not found or could not be removed."
-            }
-        }
-
-        Log "Cleanup complete."
-
-    } else {
-        Log "OS not Windows 11 yet → Cleanup skipped."
-    }
-
+    $prod = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion").ProductName
 } catch {
-    Log "ERROR during cleanup: $_"
+    $prod = ""
 }
 
-exit 0
+if ($prod -notmatch "Windows 11") {
+    Log "OS is NOT Windows 11 → Cleanup aborted."
+    exit
+}
+
+# Check if upgrade folder exists
+$root = "C:\Win11Upgrade"
+if (-not (Test-Path $root)) {
+    Log "Upgrade folder not found → Nothing to clean."
+    exit
+}
+
+Log "Confirmed Windows 11. Proceeding with cleanup."
+
+# Delete the upgrade folder
+try {
+    Remove-Item $root -Recurse -Force -ErrorAction Stop
+    Log "Deleted upgrade folder: $root"
+} catch {
+    Log "Failed to delete upgrade folder: $_"
+}
+
+# Delete scheduled tasks (optional but safe)
+foreach ($t in @("Win11Upgrade","Win11Reboot","Win11Cleanup")) {
+    try { schtasks /Delete /TN $t /F > $null 2>&1; Log "Deleted scheduled task: $t" } catch {}
+}
+
+Log "Cleanup completed successfully."
