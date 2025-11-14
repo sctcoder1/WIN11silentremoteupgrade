@@ -1,38 +1,62 @@
 # Cleanup.ps1
-$Log = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "Cleanup.log"
-function Log { param($m) ("[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $m") | Out-File $Log -Append }
+# Removes Win11Upgrade folder + scheduled tasks after successful upgrade
 
-Start-Sleep -Seconds 20
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$Log = Join-Path $ScriptDir "Cleanup.log"
+
+function Log {
+    param($msg)
+    ("[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $msg") | Out-File $Log -Append
+}
+
+Start-Sleep -Seconds 10
 Log "Cleanup started."
 
 try {
+    # Detect OS version
     $product = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion").ProductName
     Log "Detected product: $product"
-    if ($product -match "Windows 11") {
-        # Remove extracted repo dir and upgrade files
-        $Root = "C:\Win11Upgrade"
-        Log "Removing $Root ..."
-        Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue
 
-        # Remove temp admin user
-        $user = "WinUpgTemp"
-        if (Get-LocalUser -Name $user -ErrorAction SilentlyContinue) {
-            Log "Removing local user $user ..."
-            try { Remove-LocalUser -Name $user -ErrorAction SilentlyContinue } catch { Log "Failed to remove user: $_" }
+    if ($product -match "Windows 11") {
+
+        # Remove upgrade working directory
+        $Root = "C:\Win11Upgrade"
+        if (Test-Path $Root) {
+            Log "Removing directory: $Root"
+            try {
+                Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction Stop
+                Log "Directory removed successfully."
+            } catch {
+                Log "Failed to remove directory: $_"
+            }
         } else {
-            Log "Temp user $user not found."
+            Log "Directory not found: $Root"
         }
 
-        # Delete scheduled tasks if still present
-        foreach ($t in @("Win11_RepoHandler","Win11_Upgrade","Win11_Cleanup")) {
-            try { schtasks /Delete /TN $t /F > $null 2>&1 } catch {}
+        # Remove only the tasks YOU create
+        $TasksToRemove = @(
+            "Win11Upgrade",
+            "Win11Reboot",
+            "Win11Cleanup"
+        )
+
+        foreach ($task in $TasksToRemove) {
+            try {
+                schtasks /Delete /TN $task /F > $null 2>&1
+                Log "Removed scheduled task: $task"
+            } catch {
+                Log "Task $task not found or could not be removed."
+            }
         }
 
         Log "Cleanup complete."
+
     } else {
-        Log "OS not Windows 11 yet. Skipping destructive cleanup."
+        Log "OS not Windows 11 yet → Cleanup skipped."
     }
+
 } catch {
     Log "ERROR during cleanup: $_"
 }
+
 exit 0
